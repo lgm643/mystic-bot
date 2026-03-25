@@ -11,7 +11,18 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 ROLE_ID        = 913064374590140417
 CATEGORY_ID    = 1419109736091095090
 ROLE_AUTORISE  = 703339900929441803
-LOG_CHANNEL_ID = 713166766229946418  # ID du salon logs staff
+LOG_CHANNEL_ID = 713166766229946418
+
+# ── Roster ──────────────────────────────────
+ROSTER_CHANNEL_ID = 840695680288423976
+ROSTER_ROLES = [
+    (706808147796426783, "👑 Leader"),
+    (703344242017173524, "⚔️ Officier"),
+    (703339574515990549, "🛡️ Membre de confiance"),
+    (722074234611826809, "⭐ Membre +"),
+    (703339648591855656, "🔹 Membre"),
+    (739879603497336928, "🌱 Recrue"),
+]
 
 
 # ─────────────────────────────────────────────
@@ -60,7 +71,6 @@ async def generate_transcript(channel: discord.TextChannel) -> str:
 #  UTILITAIRE : envoi du log dans le salon staff
 # ─────────────────────────────────────────────
 async def send_log(guild: discord.Guild, ticket_channel: discord.TextChannel, closer: discord.Member):
-    # fetch_channel au lieu de get_channel pour éviter les problèmes de cache
     try:
         log_channel = guild.get_channel(LOG_CHANNEL_ID) or await guild.fetch_channel(LOG_CHANNEL_ID)
     except Exception as e:
@@ -93,11 +103,48 @@ async def send_log(guild: discord.Guild, ticket_channel: discord.TextChannel, cl
 
 
 # ─────────────────────────────────────────────
+#  UTILITAIRE : construction de l'embed roster
+# ─────────────────────────────────────────────
+def build_roster_embed(guild: discord.Guild) -> discord.Embed:
+    role_ids_ordered = [r[0] for r in ROSTER_ROLES]
+    categories: dict[int, list[str]] = {rid: [] for rid, _ in ROSTER_ROLES}
+
+    for member in guild.members:
+        if member.bot:
+            continue
+        member_role_ids = {r.id for r in member.roles}
+        for rid in role_ids_ordered:
+            if rid in member_role_ids:
+                categories[rid].append(member.mention)
+                break
+
+    embed = discord.Embed(
+        title="📋 Roster — La Mystic",
+        color=0x9B59B6,
+        timestamp=datetime.utcnow()
+    )
+
+    total = 0
+    for rid, label in ROSTER_ROLES:
+        members = categories[rid]
+        total  += len(members)
+        if members:
+            embed.add_field(
+                name=f"{label} ({len(members)})",
+                value="\n".join(members),
+                inline=False
+            )
+
+    embed.set_footer(text=f"Total : {total} membres")
+    return embed
+
+
+# ─────────────────────────────────────────────
 #  VUE : boutons d'ouverture de ticket
 # ─────────────────────────────────────────────
 class TicketView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=None)  # persistent : ne disparaît jamais
+        super().__init__(timeout=None)
 
     @discord.ui.button(label="📋 Demande de recrutement", style=discord.ButtonStyle.green)
     async def recrutement(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -118,7 +165,6 @@ class FermerView(discord.ui.View):
         self.action_taken = False
         self._msg: discord.Message = None
 
-    # ── Compte à rebours ──
     async def update_countdown(self, message: discord.Message):
         self._msg = message
         for remaining in range(29, 0, -1):
@@ -139,7 +185,6 @@ class FermerView(discord.ui.View):
             except (discord.NotFound, discord.HTTPException):
                 return
 
-    # ── Timeout : NE ferme PAS le ticket ──
     async def on_timeout(self):
         if self.action_taken:
             return
@@ -160,7 +205,6 @@ class FermerView(discord.ui.View):
         for child in self.children:
             child.disabled = True
 
-    # ── Confirmer la fermeture ──
     @discord.ui.button(label="✅ Confirmer la fermeture", style=discord.ButtonStyle.red)
     async def confirmer(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.action_taken:
@@ -176,17 +220,13 @@ class FermerView(discord.ui.View):
             color=0x2ECC71
         )
         await interaction.response.edit_message(embed=embed, view=self)
-
-        # Log AVANT suppression
         await send_log(interaction.guild, interaction.channel, self.closer)
-
         await asyncio.sleep(5)
         try:
             await interaction.channel.delete()
         except discord.NotFound:
             pass
 
-    # ── Annuler ──
     @discord.ui.button(label="❌ Annuler", style=discord.ButtonStyle.grey)
     async def annuler(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.action_taken:
@@ -301,7 +341,6 @@ async def fermer(ctx):
         return
 
     view = FermerView(closer=ctx.author)
-
     embed = discord.Embed(
         title="🔒 Fermer le ticket",
         description=(
@@ -311,26 +350,76 @@ async def fermer(ctx):
         color=0xFF0000
     )
     embed.set_footer(text="Aucune action = ticket conservé")
-
     msg = await ctx.send(embed=embed, view=view)
-
-    # Compte à rebours en parallèle — stocke la ref du message pour on_timeout
     asyncio.create_task(view.update_countdown(msg))
-
-    # Attend clic ou timeout — on_timeout gère le message si pas de clic
     await view.wait()
+
+
+@bot.command()
+async def roster(ctx):
+    if not ctx.author.guild_permissions.manage_guild:
+        await ctx.send("❌ Tu n'as pas la permission.", delete_after=5)
+        return
+
+    try:
+        channel = ctx.guild.get_channel(ROSTER_CHANNEL_ID) or await ctx.guild.fetch_channel(ROSTER_CHANNEL_ID)
+    except Exception:
+        await ctx.send("❌ Salon roster introuvable.", delete_after=5)
+        return
+
+    embed = build_roster_embed(ctx.guild)
+
+    existing = None
+    async for msg in channel.history(limit=20):
+        if msg.author == bot.user and msg.embeds:
+            existing = msg
+            break
+
+    if existing:
+        await existing.edit(embed=embed)
+        await ctx.send("✅ Roster mis à jour !", delete_after=5)
+    else:
+        await channel.send(embed=embed)
+        await ctx.send(f"✅ Roster posté dans {channel.mention} !", delete_after=5)
+
+
+# ─────────────────────────────────────────────
+#  EVENTS
+# ─────────────────────────────────────────────
+@bot.event
+async def on_ready():
+    print(f"✅ Mystic Bot connecté : {bot.user}")
+    print(f"   LOG_CHANNEL_ID    = {LOG_CHANNEL_ID}")
+    print(f"   ROSTER_CHANNEL_ID = {ROSTER_CHANNEL_ID}")
+
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    """Met à jour le roster automatiquement si un rôle roster change."""
+    roster_role_ids = {r[0] for r in ROSTER_ROLES}
+    before_ids = {r.id for r in before.roles}
+    after_ids  = {r.id for r in after.roles}
+
+    if before_ids & roster_role_ids == after_ids & roster_role_ids:
+        return
+
+    try:
+        channel = after.guild.get_channel(ROSTER_CHANNEL_ID) or await after.guild.fetch_channel(ROSTER_CHANNEL_ID)
+    except Exception:
+        return
+
+    embed = build_roster_embed(after.guild)
+
+    async for msg in channel.history(limit=20):
+        if msg.author == bot.user and msg.embeds:
+            await msg.edit(embed=embed)
+            return
+
+    await channel.send(embed=embed)
 
 
 # ─────────────────────────────────────────────
 #  DÉMARRAGE
 # ─────────────────────────────────────────────
-@bot.event
-async def on_ready():
-    print(f"✅ Mystic Bot connecté : {bot.user}")
-    print(f"   LOG_CHANNEL_ID = {LOG_CHANNEL_ID}")
-    if LOG_CHANNEL_ID == 0:
-        print("⚠️  LOG_CHANNEL_ID est à 0 — les logs ne fonctionneront pas !")
-
-
 TOKEN = os.environ.get("DISCORD_TOKEN")
 bot.run(TOKEN)
