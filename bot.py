@@ -30,7 +30,7 @@ ROSTER_ROLES = [
 ]
 
 STAFF_ROLE_IDS = {706808147796426783, 703344242017173524}
-ALLOWED_DOMAINS = {"discord.gg", "discord.com", "tenor.com", "giphy.com"}
+ALLOWED_DOMAINS = {"tenor.com", "giphy.com"}  # Seuls les GIFs sont autorisés
 
 # Anti-spam
 SPAM_LIMIT  = 4    # nb messages
