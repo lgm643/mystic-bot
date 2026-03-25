@@ -653,6 +653,85 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 
 
 # ─────────────────────────────────────────────
+#  COMMANDE AIDE
+# ─────────────────────────────────────────────
+bot.remove_command("help")  # Supprime le !help anglais par défaut
+
+@bot.command(name="help", aliases=["aide", "commandes"])
+async def help_cmd(ctx):
+    staff = is_staff(ctx.author)
+
+    embed = discord.Embed(
+        title="📖 Aide — Commandes du bot",
+        description="Voici toutes les commandes disponibles.\n*(🔒 = réservé au staff)*",
+        color=0x9B59B6
+    )
+
+    # ── Commandes générales ──
+    embed.add_field(
+        name="━━━━━━━━━━━━━━━━━━\n👤 Commandes générales",
+        value=(
+            "`!info @membre` — Affiche les infos complètes d'un membre "
+            "(pseudo, rôles, date d'arrivée, statut…)\n"
+            "`!help` — Affiche ce message d'aide"
+        ),
+        inline=False
+    )
+
+    # ── Tickets ──
+    embed.add_field(
+        name="━━━━━━━━━━━━━━━━━━\n🎫 Tickets",
+        value=(
+            "`!ticket` 🔒 — Affiche le panneau d'ouverture de tickets\n"
+            "`!fermer` — Ferme le ticket dans lequel tu te trouves "
+            "(génère un transcript et demande confirmation)"
+        ),
+        inline=False
+    )
+
+    # ── Roster ──
+    embed.add_field(
+        name="━━━━━━━━━━━━━━━━━━\n📋 Roster",
+        value=(
+            "`!roster` 🔒 — Met à jour le roster de la faction "
+            "(tri automatique par grade, sans doublons)"
+        ),
+        inline=False
+    )
+
+    # ── Modération (staff only) ──
+    if staff:
+        embed.add_field(
+            name="━━━━━━━━━━━━━━━━━━\n🔨 Modération 🔒",
+            value=(
+                "`!ban @membre [raison]` — Bannit définitivement un membre du serveur\n"
+                "`!kick @membre [raison]` — Expulse un membre du serveur "
+                "(il peut revenir)\n"
+                "`!mute @membre [raison]` — Empêche un membre d'envoyer des messages\n"
+                "`!unmute @membre` — Rend la parole à un membre muté\n"
+                "`!effacer <nombre>` — Supprime un nombre de messages dans le salon "
+                "(max 100)"
+            ),
+            inline=False
+        )
+
+    # ── Protections auto ──
+    embed.add_field(
+        name="━━━━━━━━━━━━━━━━━━\n🛡️ Protections automatiques",
+        value=(
+            "🔗 **Anti-liens** — Tout lien envoyé par un non-admin est supprimé "
+            "automatiquement\n"
+            "⚡ **Anti-spam** — Plus de 4 messages en 6 secondes = "
+            "avertissement, puis expulsion automatique"
+        ),
+        inline=False
+    )
+
+    embed.set_footer(text="🔒 = réservé aux Officiers et grades supérieurs")
+    await ctx.send(embed=embed)
+
+
+# ─────────────────────────────────────────────
 #  DÉMARRAGE
 # ─────────────────────────────────────────────
 @bot.event
