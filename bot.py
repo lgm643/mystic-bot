@@ -32,6 +32,9 @@ ROSTER_ROLES = [
 STAFF_ROLE_IDS = {706808147796426783, 703344242017173524}
 ALLOWED_DOMAINS = {"tenor.com", "giphy.com"}  # Seuls les GIFs sont autorisés
 
+# Salons où les non-staff peuvent utiliser des commandes
+ALLOWED_CMD_CHANNELS = {703342923634180137, 703349716183941162}
+
 # Anti-spam
 SPAM_LIMIT  = 4    # nb messages
 SPAM_WINDOW = 6.0  # secondes
@@ -70,6 +73,26 @@ def now_str() -> str:
 
 def now_utc():
     return datetime.now(timezone.utc)
+
+
+# ─────────────────────────────────────────────
+#  CHECK GLOBAL : salon autorisé pour commandes
+# ─────────────────────────────────────────────
+@bot.check
+async def check_command_channel(ctx: commands.Context) -> bool:
+    # Le staff peut utiliser les commandes partout
+    if is_staff(ctx.author):
+        return True
+    # Les non-staff doivent être dans un salon autorisé
+    if ctx.channel.id not in ALLOWED_CMD_CHANNELS:
+        channels = " ou ".join(f"<#{cid}>" for cid in ALLOWED_CMD_CHANNELS)
+        await ctx.send(
+            f"❌ {ctx.author.mention} Tu ne peux pas utiliser des commandes dans ce salon.\n"
+            f"➡️ Rends-toi dans {channels}",
+            delete_after=8
+        )
+        return False
+    return True
 
 
 # ─────────────────────────────────────────────
@@ -331,31 +354,6 @@ async def ban(ctx, member: discord.Member = None, *, reason: str = "Aucune raiso
         embed.add_field(name="🛡️ Modérateur",  value=ctx.author.mention,       inline=True)
         embed.add_field(name="📝 Raison",      value=reason,                   inline=False)
         embed.add_field(name="🕐 Date",        value=now_str(),                 inline=False)
-        await send_log(ctx.guild, embed)
-    except discord.Forbidden:
-        await ctx.send("❌ Je ne peux pas bannir ce membre (rôle supérieur au mien).", delete_after=5)
-
-
-@bot.command()
-async def banip(ctx, member: discord.Member = None, *, reason: str = "Ban renforcé"):
-    if not is_staff(ctx.author):
-        await ctx.send("❌ Permission refusée.", delete_after=5); return
-    if member is None:
-        await ctx.send("❌ Utilisation : `!banip @membre raison`", delete_after=5); return
-    if not ctx.guild.me.guild_permissions.ban_members:
-        await ctx.send("❌ Je n'ai pas la permission de bannir.", delete_after=5); return
-    try:
-        await member.ban(reason=f"[BAN RENFORCÉ] {reason}", delete_message_days=7)
-        await ctx.send(
-            f"🔨 **{member}** banni (renforcé — 7 jours de messages supprimés).\n"
-            f"⚠️ *Discord ne permet pas le ban IP. Active la vérification téléphone dans les paramètres du serveur pour bloquer les alts.*"
-        )
-        embed = discord.Embed(title="🔨 Ban Renforcé", color=0xC0392B, timestamp=now_utc())
-        embed.add_field(name="👤 Membre",     value=f"{member} ({member.id})", inline=True)
-        embed.add_field(name="🛡️ Modérateur", value=ctx.author.mention,       inline=True)
-        embed.add_field(name="📝 Raison",     value=reason,                   inline=False)
-        embed.add_field(name="🗑️ Messages",   value="7 jours supprimés",      inline=True)
-        embed.add_field(name="🕐 Date",       value=now_str(),                 inline=False)
         await send_log(ctx.guild, embed)
     except discord.Forbidden:
         await ctx.send("❌ Je ne peux pas bannir ce membre (rôle supérieur au mien).", delete_after=5)
