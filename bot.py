@@ -1038,6 +1038,9 @@ async def tracking_loop(key: str):
 # ─────────────────────────────────────────────
 @bot.command(name="tracking")
 async def tracking_cmd(ctx, pseudo: str = None, server: str = None):
+    if not is_staff(ctx.author):
+        await ctx.send("❌ Permission refusée.", delete_after=5)
+        return
     if pseudo is None or server is None:
         await ctx.send(
             "❌ Utilisation : `!tracking [joueur] [ip:port]`\n"
@@ -1076,6 +1079,9 @@ async def tracking_cmd(ctx, pseudo: str = None, server: str = None):
 # ─────────────────────────────────────────────
 @bot.command(name="classement", aliases=["leaderboard", "top"])
 async def classement_cmd(ctx):
+    if not is_staff(ctx.author):
+        await ctx.send("❌ Permission refusée.", delete_after=5)
+        return
     data = load_data()
     if not data:
         await ctx.send("❌ Aucun joueur suivi pour le moment.", delete_after=8)
@@ -1139,6 +1145,9 @@ async def classement_cmd(ctx):
 # ─────────────────────────────────────────────
 @bot.command(name="stoptracking")
 async def stoptracking_cmd(ctx, pseudo: str = None, server: str = None):
+    if not is_staff(ctx.author):
+        await ctx.send("❌ Permission refusée.", delete_after=5)
+        return
     if pseudo is None or server is None:
         await ctx.send("❌ Utilisation : `!stoptracking [joueur] [ip:port]`", delete_after=8)
         return
