@@ -728,19 +728,20 @@ async def help_cmd(ctx):
     )
 
     # ── Tracking Minecraft ──
-    embed.add_field(
-        name="━━━━━━━━━━━━━━━━━━\n🎮 Tracking Minecraft Bedrock",
-        value=(
-            "`!tracking [joueur] [ip:port]` — Commence à surveiller un joueur sur un serveur Bedrock. "
-            "Affiche un embed avec son statut et son temps de jeu, mis à jour toutes les 10s\n"
-            "`!classement` — Affiche le top 10 des joueurs par temps de jeu "
-            "(total, semaine, mois)\n"
-            "`!stoptracking [joueur] [ip:port]` — Arrête le tracking d'un joueur\n\n"
-            "⚠️ *Le tracking Bedrock est approximatif : Discord ne peut pas "
-            "lire la liste exacte des joueurs connectés.*"
-        ),
-        inline=False
-    )
+    if staff:
+        embed.add_field(
+            name="━━━━━━━━━━━━━━━━━━\n🎮 Tracking Minecraft Bedrock 🔒",
+            value=(
+                "`!tracking [joueur] [ip:port]` — Commence à surveiller un joueur sur un serveur Bedrock. "
+                "Affiche un embed avec son statut et son temps de jeu, mis à jour toutes les 10s\n"
+                "`!classement` — Affiche le top 10 des joueurs par temps de jeu "
+                "(total, semaine, mois)\n"
+                "`!stoptracking [joueur] [ip:port]` — Arrête le tracking d'un joueur\n\n"
+                "⚠️ *Le tracking Bedrock est approximatif : Discord ne peut pas "
+                "lire la liste exacte des joueurs connectés.*"
+            ),
+            inline=False
+        )
 
     embed.set_footer(text="🔒 = réservé aux Officiers et grades supérieurs")
     await ctx.send(embed=embed)
