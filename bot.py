@@ -5,14 +5,18 @@ import io
 import os
 import re
 import time
+import json
+import socket
+import struct
 from datetime import datetime, timezone
 from collections import defaultdict
+from pathlib import Path
 
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ─────────────────────────────────────────────
-#  CONSTANTES
+#  CONSTANTES GÉNÉRALES
 # ─────────────────────────────────────────────
 ROLE_ID           = 913064374590140417
 CATEGORY_ID       = 1419109736091095090
@@ -29,22 +33,25 @@ ROSTER_ROLES = [
     (739879603497336928, "🌱 Recrue"),
 ]
 
-STAFF_ROLE_IDS = {706808147796426783, 703344242017173524}
-ALLOWED_DOMAINS = {"tenor.com", "giphy.com"}  # Seuls les GIFs sont autorisés
-
-# Salons où les non-staff peuvent utiliser des commandes
+STAFF_ROLE_IDS       = {706808147796426783, 703344242017173524}
+ALLOWED_DOMAINS      = {"tenor.com", "giphy.com"}
 ALLOWED_CMD_CHANNELS = {703342923634180137, 703349716183941162}
 
-# Anti-spam
-SPAM_LIMIT  = 4    # nb messages
-SPAM_WINDOW = 6.0  # secondes
+SPAM_LIMIT  = 4
+SPAM_WINDOW = 6.0
 spam_tracker: dict[int, list[float]] = defaultdict(list)
 spam_warned:  set[int] = set()
 
+# ─────────────────────────────────────────────
+#  CONSTANTES TRACKING
+# ─────────────────────────────────────────────
+TRACKING_FILE    = "tracking_data.json"
+active_trackers: dict[str, dict] = {}  # key → {msg_id, channel_id}
 
-# ─────────────────────────────────────────────
-#  UTILITAIRES
-# ─────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════
+#  UTILITAIRES GÉNÉRAUX
+# ═══════════════════════════════════════════════════════════════
 def is_staff(member: discord.Member) -> bool:
     if member.guild_permissions.administrator:
         return True
@@ -71,7 +78,7 @@ def now_str() -> str:
     return discord.utils.format_dt(datetime.now(timezone.utc), style="F")
 
 
-def now_utc():
+def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
@@ -80,10 +87,8 @@ def now_utc():
 # ─────────────────────────────────────────────
 @bot.check
 async def check_command_channel(ctx: commands.Context) -> bool:
-    # Le staff peut utiliser les commandes partout
     if is_staff(ctx.author):
         return True
-    # Les non-staff doivent être dans un salon autorisé
     if ctx.channel.id not in ALLOWED_CMD_CHANNELS:
         channels = " ou ".join(f"<#{cid}>" for cid in ALLOWED_CMD_CHANNELS)
         await ctx.send(
@@ -95,9 +100,9 @@ async def check_command_channel(ctx: commands.Context) -> bool:
     return True
 
 
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 #  TRANSCRIPT HTML
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 async def generate_transcript(channel: discord.TextChannel) -> str:
     messages = []
     async for msg in channel.history(limit=None, oldest_first=True):
@@ -137,9 +142,9 @@ async def send_ticket_log(guild, ticket_channel, closer):
         print(f"[LOG] Erreur ticket : {e}")
 
 
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 #  ROSTER
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 def build_roster_embed(guild: discord.Guild) -> discord.Embed:
     role_ids_ordered = [r[0] for r in ROSTER_ROLES]
     categories: dict[int, list[str]] = {rid: [] for rid, _ in ROSTER_ROLES}
@@ -162,9 +167,9 @@ def build_roster_embed(guild: discord.Guild) -> discord.Embed:
     return embed
 
 
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 #  VUES TICKETS
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 class TicketView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -247,9 +252,9 @@ class FermerView(discord.ui.View):
         await interaction.response.edit_message(embed=embed, view=self)
 
 
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 #  CRÉATION TICKET
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 async def creer_ticket(interaction: discord.Interaction, type_ticket: str):
     guild    = interaction.guild
     role     = guild.get_role(ROLE_ID)
@@ -265,26 +270,26 @@ async def creer_ticket(interaction: discord.Interaction, type_ticket: str):
             f"{role.mention} | {interaction.user.mention}\n\n"
             f"📋 **FORMULAIRE DE RECRUTEMENT – LA MYSTIC**\n\n"
             f"**1️⃣ Présentation personnelle**\n➤ Pseudo EXACT en jeu :\n➤ Âge (minimum 14 ans) :\n"
-            f"➤ Style de jeu : (PvP / Farm / Build / Polyvalent)\n➤ Expérience en faction / Points forts :\n\n"
-            f"**2️⃣ Objectifs personnels**\n➤ Court terme :\n➤ Long terme :\n\n"
-            f"**3️⃣ Motivation**\n➤ Pourquoi rejoindre la Mystic ?\n➤ Ce que tu recherches :\n➤ Ce que tu peux apporter :\n\n"
+            f"➤ Style de jeu : (PvP / Farm / Build / Polyvalent)\n➤ Expérience / Points forts :\n\n"
+            f"**2️⃣ Objectifs**\n➤ Court terme :\n➤ Long terme :\n\n"
+            f"**3️⃣ Motivation**\n➤ Pourquoi rejoindre la Mystic ?\n➤ Ce que tu recherches :\n➤ Ce que tu apportes :\n\n"
             f"**4️⃣ Historique**\n➤ Anciennes factions :\n➤ Raison de départ :\n\n"
             f"**5️⃣ Stuff actuel**\n➤ Plateforme : (PS / Xbox / PC / Mobile)\n➤ Armure, armes, enchantements :\n\n"
             f"**6️⃣ Disponibilités**\n➤ Jours par semaine :\n➤ Plages horaires :\n\n"
             f"**7️⃣ Auto-critique**\n➤ Point faible en faction ?\n\n"
-            f"**8️⃣ Mentalité**\n➤ Membre idéal d'une faction ?\n➤ Vision du travail d'équipe ?\n\n"
+            f"**8️⃣ Mentalité**\n➤ Membre idéal ?\n➤ Vision du travail d'équipe ?\n\n"
             f"**9️⃣ Infos complémentaires**\n➤ Screenshots OBLIGATOIRES\n➤ Autres infos :\n\n"
             f"**✅ Confirmation**\n☐ J'ai 14 ans ou plus\n☐ Je respecterai les règles\n☐ Toute fausse info = refus"
         )
     else:
-        texte = f"{role.mention} | {interaction.user.mention}\n\n📩 **Autre demande**\n\nExplique ta demande, un membre te répondra rapidement.\nPour fermer : `!fermer`"
+        texte = f"{role.mention} | {interaction.user.mention}\n\n📩 **Autre demande**\n\nExplique ta demande, un membre te répondra.\nPour fermer : `!fermer`"
     await channel.send(texte)
     await interaction.response.send_message(f"✅ Ticket créé : {channel.mention}", ephemeral=True)
 
 
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 #  COMMANDES TICKETS
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 @bot.command()
 async def ticket(ctx):
     role_autorise = ctx.guild.get_role(ROLE_AUTORISE)
@@ -308,9 +313,9 @@ async def fermer(ctx):
     await view.wait()
 
 
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 #  COMMANDES ROSTER
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 @bot.command()
 async def roster(ctx):
     if not is_staff(ctx.author):
@@ -335,9 +340,9 @@ async def roster(ctx):
         await ctx.send(f"✅ Roster posté dans {channel.mention} !", delete_after=5)
 
 
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 #  COMMANDES MODÉRATION
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 @bot.command()
 async def ban(ctx, member: discord.Member = None, *, reason: str = "Aucune raison fournie"):
     if not is_staff(ctx.author):
@@ -350,13 +355,13 @@ async def ban(ctx, member: discord.Member = None, *, reason: str = "Aucune raiso
         await member.ban(reason=reason, delete_message_days=1)
         await ctx.send(f"🔨 **{member}** a été banni. Raison : {reason}")
         embed = discord.Embed(title="🔨 Ban", color=0xE74C3C, timestamp=now_utc())
-        embed.add_field(name="👤 Membre",      value=f"{member} ({member.id})", inline=True)
-        embed.add_field(name="🛡️ Modérateur",  value=ctx.author.mention,       inline=True)
-        embed.add_field(name="📝 Raison",      value=reason,                   inline=False)
-        embed.add_field(name="🕐 Date",        value=now_str(),                 inline=False)
+        embed.add_field(name="👤 Membre",     value=f"{member} ({member.id})", inline=True)
+        embed.add_field(name="🛡️ Modérateur", value=ctx.author.mention,       inline=True)
+        embed.add_field(name="📝 Raison",     value=reason,                   inline=False)
+        embed.add_field(name="🕐 Date",       value=now_str(),                 inline=False)
         await send_log(ctx.guild, embed)
     except discord.Forbidden:
-        await ctx.send("❌ Je ne peux pas bannir ce membre (rôle supérieur au mien).", delete_after=5)
+        await ctx.send("❌ Je ne peux pas bannir ce membre.", delete_after=5)
 
 
 @bot.command()
@@ -437,12 +442,12 @@ async def effacer(ctx, nombre: int = None):
     await send_log(ctx.guild, embed)
 
 
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 #  COMMANDE INFO
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 @bot.command()
 async def info(ctx, member: discord.Member = None):
-    member = member or ctx.author
+    member   = member or ctx.author
     roles    = [r.mention for r in reversed(member.roles) if r.name != "@everyone"]
     top_role = member.top_role.mention if member.top_role.name != "@everyone" else "Aucun"
     perms = []
@@ -461,10 +466,10 @@ async def info(ctx, member: discord.Member = None):
     status   = status_map.get(member.status, "⚫ Inconnu")
     activity = "Aucune"
     if member.activity:
-        if isinstance(member.activity, discord.Game):           activity = f"🎮 {member.activity.name}"
-        elif isinstance(member.activity, discord.Streaming):    activity = f"📺 {member.activity.name}"
+        if isinstance(member.activity, discord.Game):             activity = f"🎮 {member.activity.name}"
+        elif isinstance(member.activity, discord.Streaming):      activity = f"📺 {member.activity.name}"
         elif isinstance(member.activity, discord.CustomActivity): activity = f"💬 {member.activity.name}"
-        else:                                                    activity = member.activity.name
+        else:                                                      activity = member.activity.name
     embed = discord.Embed(
         title=f"👤 {member.display_name}",
         color=member.color if member.color != discord.Color.default() else 0x3498DB,
@@ -473,44 +478,39 @@ async def info(ctx, member: discord.Member = None):
     embed.set_thumbnail(url=member.display_avatar.url)
     if member.banner:
         embed.set_image(url=member.banner.url)
-    embed.add_field(name="📛 Pseudo",          value=member.display_name, inline=True)
-    embed.add_field(name="🏷️ Tag",             value=str(member),         inline=True)
-    embed.add_field(name="🤖 Bot",              value="✅" if member.bot else "❌", inline=True)
-    embed.add_field(name="🆔 ID",               value=str(member.id),     inline=True)
-    embed.add_field(name="📅 Compte créé",      value=discord.utils.format_dt(member.created_at, style="D"), inline=True)
-    embed.add_field(name="📥 Arrivée serveur",  value=discord.utils.format_dt(member.joined_at, style="D") if member.joined_at else "?", inline=True)
-    embed.add_field(name="📶 Statut",           value=status,             inline=True)
-    embed.add_field(name="🎯 Activité",         value=activity,           inline=True)
-    embed.add_field(name="🎖️ Rôle principal",   value=top_role,           inline=True)
+    embed.add_field(name="📛 Pseudo",         value=member.display_name, inline=True)
+    embed.add_field(name="🏷️ Tag",            value=str(member),         inline=True)
+    embed.add_field(name="🤖 Bot",             value="✅" if member.bot else "❌", inline=True)
+    embed.add_field(name="🆔 ID",              value=str(member.id),     inline=True)
+    embed.add_field(name="📅 Compte créé",     value=discord.utils.format_dt(member.created_at, style="D"), inline=True)
+    embed.add_field(name="📥 Arrivée serveur", value=discord.utils.format_dt(member.joined_at, style="D") if member.joined_at else "?", inline=True)
+    embed.add_field(name="📶 Statut",          value=status,             inline=True)
+    embed.add_field(name="🎯 Activité",        value=activity,           inline=True)
+    embed.add_field(name="🎖️ Rôle principal",  value=top_role,           inline=True)
     embed.add_field(name=f"🎭 Rôles ({len(roles)})", value=", ".join(roles[:20]) or "Aucun", inline=False)
-    embed.add_field(name="🔑 Permissions",      value=", ".join(perms) or "Aucune", inline=False)
+    embed.add_field(name="🔑 Permissions",     value=", ".join(perms) or "Aucune", inline=False)
     embed.set_footer(text=f"Demandé par {ctx.author}")
     await ctx.send(embed=embed)
 
 
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 #  ON_MESSAGE : ANTI-LIENS + ANTI-SPAM
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 @bot.event
 async def on_message(message: discord.Message):
-    # Ignore les bots et les DMs
     if message.author.bot or not message.guild:
         await bot.process_commands(message)
         return
-
     member = message.author
 
-    # ── ANTI-LIENS ───────────────────────────
+    # ── Anti-liens ──
     url_pattern = re.compile(r"(https?://|www\.)\S+", re.IGNORECASE)
     if url_pattern.search(message.content):
-        # Seuls les admins peuvent envoyer des liens
         if not member.guild_permissions.administrator:
-            # Extrait le domaine
             domain_match = re.search(r"(?:https?://|www\.)([^/\s]+)", message.content, re.IGNORECASE)
             domain = domain_match.group(1).lower() if domain_match else ""
-            # Vérifie la whitelist
             if not any(domain == d or domain.endswith("." + d) for d in ALLOWED_DOMAINS):
-                print(f"[ANTI-LIENS] Suppression du message de {member} : {message.content[:100]}")
+                print(f"[ANTI-LIENS] {member} : {message.content[:80]}")
                 try:
                     await message.delete()
                     await message.channel.send(
@@ -521,60 +521,50 @@ async def on_message(message: discord.Message):
                     embed.add_field(name="👤 Auteur",  value=f"{member} ({member.id})", inline=True)
                     embed.add_field(name="📍 Salon",   value=message.channel.mention,   inline=True)
                     embed.add_field(name="💬 Contenu", value=message.content[:500],     inline=False)
-                    embed.add_field(name="🕐 Date",    value=now_str(),                  inline=False)
                     await send_log(message.guild, embed)
                 except discord.Forbidden:
-                    print(f"[ANTI-LIENS] Permission manquante — donne au bot 'Gérer les messages' dans Discord")
+                    print("[ANTI-LIENS] Permission manquante — active 'Gérer les messages' pour le bot")
                 except Exception as e:
                     print(f"[ANTI-LIENS] Erreur : {e}")
-                return  # Stop, pas besoin de vérifier le spam
+                return
 
-    # ── ANTI-SPAM ────────────────────────────
-    # Ignore le staff
+    # ── Anti-spam ──
     if not is_staff(member):
         now = time.monotonic()
-        # Ajoute le timestamp et nettoie les anciens
         spam_tracker[member.id].append(now)
         spam_tracker[member.id] = [t for t in spam_tracker[member.id] if now - t <= SPAM_WINDOW]
-
         count = len(spam_tracker[member.id])
-        print(f"[ANTI-SPAM] {member} : {count} messages en {SPAM_WINDOW}s (limite={SPAM_LIMIT})")
+        print(f"[ANTI-SPAM] {member} : {count}/{SPAM_LIMIT} msgs en {SPAM_WINDOW}s")
 
         if count > SPAM_LIMIT:
             if member.id in spam_warned:
-                # 2e infraction → kick
-                print(f"[ANTI-SPAM] Kick de {member} pour spam répété")
+                print(f"[ANTI-SPAM] Kick de {member}")
                 spam_warned.discard(member.id)
                 spam_tracker.pop(member.id, None)
                 try:
-                    await member.kick(reason="Anti-spam automatique — spam répété")
-                    await message.channel.send(
-                        f"🚫 {member.mention} a été **expulsé** pour spam répété.",
-                        delete_after=10
-                    )
+                    await member.kick(reason="Anti-spam automatique")
+                    await message.channel.send(f"🚫 {member.mention} expulsé pour spam répété.", delete_after=10)
                     embed = discord.Embed(title="🚫 Kick Anti-Spam", color=0xE74C3C, timestamp=now_utc())
                     embed.add_field(name="👤 Membre", value=f"{member} ({member.id})", inline=True)
                     embed.add_field(name="📍 Salon",  value=message.channel.mention,   inline=True)
-                    embed.add_field(name="🕐 Date",   value=now_str(),                  inline=False)
                     await send_log(message.guild, embed)
                 except discord.Forbidden:
-                    print(f"[ANTI-SPAM] Permission manquante pour kick — donne au bot 'Expulser des membres'")
+                    print("[ANTI-SPAM] Permission manquante pour kick")
             else:
-                # 1re infraction → avertissement
                 print(f"[ANTI-SPAM] Avertissement de {member}")
                 spam_warned.add(member.id)
-                spam_tracker[member.id] = []  # Reset le compteur après l'avertissement
+                spam_tracker[member.id] = []
                 await message.channel.send(
-                    f"⚠️ {member.mention} **Stop le spam !** Si tu continues, tu seras **expulsé automatiquement**.",
+                    f"⚠️ {member.mention} **Stop le spam !** Prochaine fois = **expulsion automatique**.",
                     delete_after=10
                 )
 
     await bot.process_commands(message)
 
 
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 #  LOGS AUTO
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 @bot.event
 async def on_message_delete(message: discord.Message):
     if message.author.bot or not message.guild:
@@ -584,7 +574,6 @@ async def on_message_delete(message: discord.Message):
     embed.add_field(name="📍 Salon",   value=message.channel.mention,                   inline=True)
     embed.add_field(name="💬 Contenu", value=message.content[:1000] or "<vide>",        inline=False)
     embed.add_field(name="🆔 ID",      value=str(message.id),                           inline=True)
-    embed.add_field(name="🕐 Date",    value=now_str(),                                  inline=False)
     await send_log(message.guild, embed)
 
 
@@ -593,12 +582,11 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
     if before.author.bot or not before.guild or before.content == after.content:
         return
     embed = discord.Embed(title="✏️ Message modifié", color=0x3498DB, timestamp=now_utc())
-    embed.add_field(name="👤 Auteur",  value=f"{before.author} ({before.author.id})", inline=True)
-    embed.add_field(name="📍 Salon",   value=before.channel.mention,                  inline=True)
-    embed.add_field(name="📝 Avant",   value=before.content[:500] or "<vide>",        inline=False)
-    embed.add_field(name="📝 Après",   value=after.content[:500] or "<vide>",         inline=False)
-    embed.add_field(name="🔗 Lien",    value=f"[Voir]({after.jump_url})",             inline=True)
-    embed.add_field(name="🕐 Date",    value=now_str(),                                inline=False)
+    embed.add_field(name="👤 Auteur", value=f"{before.author} ({before.author.id})", inline=True)
+    embed.add_field(name="📍 Salon",  value=before.channel.mention,                  inline=True)
+    embed.add_field(name="📝 Avant",  value=before.content[:500] or "<vide>",        inline=False)
+    embed.add_field(name="📝 Après",  value=after.content[:500] or "<vide>",         inline=False)
+    embed.add_field(name="🔗 Lien",   value=f"[Voir]({after.jump_url})",             inline=True)
     await send_log(before.guild, embed)
 
 
@@ -606,9 +594,9 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
 async def on_member_join(member: discord.Member):
     embed = discord.Embed(title="📥 Membre arrivé", color=0x2ECC71, timestamp=now_utc())
     embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="👤 Membre",       value=f"{member} ({member.id})", inline=True)
-    embed.add_field(name="📅 Compte créé",  value=discord.utils.format_dt(member.created_at, style="D"), inline=True)
-    embed.add_field(name="👥 Total",        value=str(member.guild.member_count), inline=True)
+    embed.add_field(name="👤 Membre",      value=f"{member} ({member.id})", inline=True)
+    embed.add_field(name="📅 Compte créé", value=discord.utils.format_dt(member.created_at, style="D"), inline=True)
+    embed.add_field(name="👥 Total",       value=str(member.guild.member_count), inline=True)
     await send_log(member.guild, embed)
 
 
@@ -623,7 +611,6 @@ async def on_member_remove(member: discord.Member):
 
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
-    # Roster auto
     roster_role_ids = {r[0] for r in ROSTER_ROLES}
     before_ids = {r.id for r in before.roles}
     after_ids  = {r.id for r in after.roles}
@@ -638,7 +625,6 @@ async def on_member_update(before: discord.Member, after: discord.Member):
             await channel.send(embed=embed)
         except Exception:
             pass
-    # Log rôles
     added   = set(after.roles) - set(before.roles)
     removed = set(before.roles) - set(after.roles)
     if added or removed:
@@ -648,138 +634,17 @@ async def on_member_update(before: discord.Member, after: discord.Member):
             embed.add_field(name="✅ Ajoutés",  value=", ".join(r.mention for r in added),   inline=False)
         if removed:
             embed.add_field(name="❌ Retirés",  value=", ".join(r.mention for r in removed), inline=False)
-        embed.add_field(name="🕐 Date", value=now_str(), inline=False)
         await send_log(after.guild, embed)
-
-
-# ─────────────────────────────────────────────
-#  COMMANDE AIDE
-# ─────────────────────────────────────────────
-bot.remove_command("help")  # Supprime le !help anglais par défaut
-
-@bot.command(name="help", aliases=["aide", "commandes"])
-async def help_cmd(ctx):
-    staff = is_staff(ctx.author)
-
-    embed = discord.Embed(
-        title="📖 Aide — Commandes du bot",
-        description="Voici toutes les commandes disponibles.\n*(🔒 = réservé au staff)*",
-        color=0x9B59B6
-    )
-
-    # ── Commandes générales ──
-    embed.add_field(
-        name="━━━━━━━━━━━━━━━━━━\n👤 Commandes générales",
-        value=(
-            "`!info @membre` — Affiche les infos complètes d'un membre "
-            "(pseudo, rôles, date d'arrivée, statut…)\n"
-            "`!help` — Affiche ce message d'aide"
-        ),
-        inline=False
-    )
-
-    # ── Tickets ──
-    embed.add_field(
-        name="━━━━━━━━━━━━━━━━━━\n🎫 Tickets",
-        value=(
-            "`!ticket` 🔒 — Affiche le panneau d'ouverture de tickets\n"
-            "`!fermer` — Ferme le ticket dans lequel tu te trouves "
-            "(génère un transcript et demande confirmation)"
-        ),
-        inline=False
-    )
-
-    # ── Roster ──
-    embed.add_field(
-        name="━━━━━━━━━━━━━━━━━━\n📋 Roster",
-        value=(
-            "`!roster` 🔒 — Met à jour le roster de la faction "
-            "(tri automatique par grade, sans doublons)"
-        ),
-        inline=False
-    )
-
-    # ── Modération (staff only) ──
-    if staff:
-        embed.add_field(
-            name="━━━━━━━━━━━━━━━━━━\n🔨 Modération 🔒",
-            value=(
-                "`!ban @membre [raison]` — Bannit définitivement un membre du serveur\n"
-                "`!kick @membre [raison]` — Expulse un membre du serveur "
-                "(il peut revenir)\n"
-                "`!mute @membre [raison]` — Empêche un membre d'envoyer des messages\n"
-                "`!unmute @membre` — Rend la parole à un membre muté\n"
-                "`!effacer <nombre>` — Supprime un nombre de messages dans le salon "
-                "(max 100)"
-            ),
-            inline=False
-        )
-
-    # ── Protections auto ──
-    embed.add_field(
-        name="━━━━━━━━━━━━━━━━━━\n🛡️ Protections automatiques",
-        value=(
-            "🔗 **Anti-liens** — Tout lien envoyé par un non-admin est supprimé "
-            "automatiquement\n"
-            "⚡ **Anti-spam** — Plus de 4 messages en 6 secondes = "
-            "avertissement, puis expulsion automatique"
-        ),
-        inline=False
-    )
-
-    # ── Tracking Minecraft ──
-    if staff:
-        embed.add_field(
-            name="━━━━━━━━━━━━━━━━━━\n🎮 Tracking Minecraft Bedrock 🔒",
-            value=(
-                "`!tracking [joueur] [ip:port]` — Commence à surveiller un joueur sur un serveur Bedrock. "
-                "Affiche un embed avec son statut et son temps de jeu, mis à jour toutes les 10s\n"
-                "`!classement` — Affiche le top 10 des joueurs par temps de jeu "
-                "(total, semaine, mois)\n"
-                "`!stoptracking [joueur] [ip:port]` — Arrête le tracking d'un joueur\n\n"
-                "⚠️ *Le tracking Bedrock est approximatif : Discord ne peut pas "
-                "lire la liste exacte des joueurs connectés.*"
-            ),
-            inline=False
-        )
-
-    embed.set_footer(text="🔒 = réservé aux Officiers et grades supérieurs")
-    await ctx.send(embed=embed)
-
-# ─────────────────────────────────────────────
-#  DÉMARRAGE
-# ─────────────────────────────────────────────
-@bot.event
-async def on_ready():
-    print(f"✅ Mystic Bot connecté : {bot.user}")
-    print(f"   LOG_CHANNEL_ID    = {LOG_CHANNEL_ID}")
-    print(f"   ROSTER_CHANNEL_ID = {ROSTER_CHANNEL_ID}")
-    print(f"   Anti-spam         : {SPAM_LIMIT} msgs / {SPAM_WINDOW}s")
-
-
-TOKEN = os.environ.get("DISCORD_TOKEN")
-bot.run(TOKEN)
 
 
 # ═══════════════════════════════════════════════════════════════
 #  SYSTÈME DE TRACKING MINECRAFT BEDROCK
 # ═══════════════════════════════════════════════════════════════
-import json
-import socket
-import struct
-from pathlib import Path
-
-TRACKING_FILE    = "tracking_data.json"
-TRACKING_CHANNEL = None   # Sera défini au premier !tracking
-# {player_key: {"msg_id": int, "channel_id": int, ...}}
-active_trackers: dict[str, dict] = {}
-
 
 # ─────────────────────────────────────────────
-#  UTILITAIRES TEMPS
+#  Utilitaires temps
 # ─────────────────────────────────────────────
 def fmt_time(seconds: float) -> str:
-    """Formate des secondes en '2h 15m 30s'."""
     seconds = int(seconds)
     if seconds <= 0:
         return "0s"
@@ -797,7 +662,7 @@ def player_key(pseudo: str, server: str) -> str:
 
 
 # ─────────────────────────────────────────────
-#  STOCKAGE JSON
+#  Stockage JSON
 # ─────────────────────────────────────────────
 def load_data() -> dict:
     if Path(TRACKING_FILE).exists():
@@ -810,102 +675,87 @@ def load_data() -> dict:
 
 
 def save_data(data: dict):
-    with open(TRACKING_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    try:
+        with open(TRACKING_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"[TRACKING] Erreur sauvegarde JSON : {e}")
 
 
 def get_player(data: dict, key: str) -> dict:
-    """Retourne le dict joueur, crée-le s'il n'existe pas."""
     if key not in data:
-        now = datetime.now(timezone.utc).isoformat()
+        now_iso = now_utc().isoformat()
+        parts   = key.split("@", 1)
         data[key] = {
-            "pseudo":          key.split("@")[0],
-            "server":          key.split("@", 1)[1],
-            "online":          False,
-            "last_seen":       None,
-            "session_start":   None,
-            "playtime_total":  0.0,
-            "playtime_day":    0.0,
-            "playtime_week":   0.0,
-            "playtime_month":  0.0,
-            "reset_day":       now,
-            "reset_week":      now,
-            "reset_month":     now,
+            "pseudo":         parts[0],
+            "server":         parts[1] if len(parts) > 1 else "?",
+            "online":         False,
+            "last_seen":      None,
+            "session_start":  None,
+            "playtime_total": 0.0,
+            "playtime_day":   0.0,
+            "playtime_week":  0.0,
+            "playtime_month": 0.0,
+            "reset_day":      now_iso,
+            "reset_week":     now_iso,
+            "reset_month":    now_iso,
         }
     return data[key]
 
 
 # ─────────────────────────────────────────────
-#  RESET AUTOMATIQUE DES COMPTEURS
+#  Reset automatique des compteurs
 # ─────────────────────────────────────────────
 def apply_resets(p: dict):
-    """Reset les compteurs jour/semaine/mois si nécessaire."""
-    now = datetime.now(timezone.utc)
-
+    now = now_utc()
     last_day   = datetime.fromisoformat(p["reset_day"]).replace(tzinfo=timezone.utc)
     last_week  = datetime.fromisoformat(p["reset_week"]).replace(tzinfo=timezone.utc)
     last_month = datetime.fromisoformat(p["reset_month"]).replace(tzinfo=timezone.utc)
-
-    # Reset jour
     if now.date() > last_day.date():
         p["playtime_day"]  = 0.0
         p["reset_day"]     = now.isoformat()
-
-    # Reset semaine (lundi)
     if now.isocalendar()[1] != last_week.isocalendar()[1] or now.year != last_week.year:
         p["playtime_week"] = 0.0
         p["reset_week"]    = now.isoformat()
-
-    # Reset mois
     if now.month != last_month.month or now.year != last_month.year:
         p["playtime_month"] = 0.0
         p["reset_month"]    = now.isoformat()
 
 
 # ─────────────────────────────────────────────
-#  PING BEDROCK via UDP
+#  Ping Bedrock UDP
 # ─────────────────────────────────────────────
 def ping_bedrock(host: str, port: int, timeout: float = 5.0) -> dict | None:
-    """
-    Ping un serveur Minecraft Bedrock via UDP RakNet.
-    Fonctionne avec les hostnames (résolution DNS incluse).
-    Retourne un dict ou None si le serveur ne répond pas.
-    """
-    MAGIC = b"\x00\xff\xff\x00\xfe\xfe\xfe\xfe\xfd\xfd\xfd\xfd\x12\x34\x56\x78"
+    MAGIC       = b"\x00\xff\xff\x00\xfe\xfe\xfe\xfe\xfd\xfd\xfd\xfd\x12\x34\x56\x78"
     CLIENT_GUID = b"\x00" * 8
     timestamp   = struct.pack(">Q", int(time.time() * 1000) & 0xFFFFFFFFFFFFFFFF)
     packet      = b"\x01" + timestamp + MAGIC + CLIENT_GUID
-
     try:
-        # Résolution DNS
         addr_info = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_DGRAM)
-        ip = addr_info[0][4][0]
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        ip        = addr_info[0][4][0]
+        sock      = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(timeout)
         sock.sendto(packet, (ip, port))
-        data, _ = sock.recvfrom(2048)
+        data, _   = sock.recvfrom(2048)
         sock.close()
-
-        # Minimum viable response
         if len(data) < 35:
             return {"online": True, "online_players": 0, "max_players": 0, "motd": ""}
-
         str_len  = struct.unpack(">H", data[33:35])[0]
         motd_raw = data[35:35 + str_len].decode("utf-8", errors="ignore")
         parts    = motd_raw.split(";")
-
+        op = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
+        mp = int(parts[5]) if len(parts) > 5 and parts[5].isdigit() else 0
         return {
             "online":         True,
-            "online_players": int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0,
-            "max_players":    int(parts[5]) if len(parts) > 5 and parts[5].isdigit() else 0,
+            "online_players": op,
+            "max_players":    mp,
             "motd":           parts[1] if len(parts) > 1 else "",
         }
     except socket.gaierror as e:
-        print(f"[TRACKING] Erreur DNS pour {host} : {e}")
+        print(f"[TRACKING] DNS {host} : {e}")
         return None
     except socket.timeout:
-        print(f"[TRACKING] Timeout pour {host}:{port}")
+        print(f"[TRACKING] Timeout {host}:{port}")
         return None
     except Exception as e:
         print(f"[TRACKING] Erreur ping {host}:{port} : {e}")
@@ -913,13 +763,12 @@ def ping_bedrock(host: str, port: int, timeout: float = 5.0) -> dict | None:
 
 
 # ─────────────────────────────────────────────
-#  CONSTRUCTION DE L'EMBED JOUEUR
+#  Construction embed joueur
 # ─────────────────────────────────────────────
-def build_player_embed(p: dict) -> discord.Embed:
+def build_player_embed(p: dict, response: dict | None = None) -> discord.Embed:
     apply_resets(p)
-    now = datetime.now(timezone.utc)
+    now = now_utc()
 
-    # Temps de session en cours
     live_seconds = 0.0
     if p["online"] and p["session_start"]:
         session_start = datetime.fromisoformat(p["session_start"]).replace(tzinfo=timezone.utc)
@@ -932,77 +781,69 @@ def build_player_embed(p: dict) -> discord.Embed:
         last_seen_dt = datetime.fromisoformat(p["last_seen"]).replace(tzinfo=timezone.utc)
         last_seen    = discord.utils.format_dt(last_seen_dt, style="F")
 
-    color = 0x2ECC71 if p["online"] else 0xE74C3C
+    # Infos serveur en temps réel
+    server_info = ""
+    if response:
+        server_info = f" *(👥 {response.get('online_players', '?')}/{response.get('max_players', '?')})*"
 
-    embed = discord.Embed(
-        title=f"🎮 Tracking — {p['pseudo']}",
-        color=color,
-        timestamp=now
-    )
-    embed.add_field(name="👤 Joueur",               value=p["pseudo"],                                          inline=True)
-    embed.add_field(name="🌐 Serveur",              value=p["server"],                                          inline=True)
-    embed.add_field(name="📶 Statut",               value=status_emoji,                                         inline=True)
-    embed.add_field(name="🕒 Dernière connexion",   value=last_seen,                                            inline=False)
-    embed.add_field(name="⏱️ Aujourd'hui",          value=fmt_time(p["playtime_day"]  + live_seconds),          inline=True)
-    embed.add_field(name="📅 Cette semaine",        value=fmt_time(p["playtime_week"] + live_seconds),          inline=True)
-    embed.add_field(name="🗓️ Ce mois",             value=fmt_time(p["playtime_month"] + live_seconds),         inline=True)
-    embed.add_field(name="🧮 Total",                value=fmt_time(p["playtime_total"] + live_seconds),         inline=True)
-    embed.set_footer(text="Mise à jour toutes les 10s • Tracking approximatif (Bedrock)")
+    color = 0x2ECC71 if p["online"] else 0xE74C3C
+    embed = discord.Embed(title=f"🎮 Tracking — {p['pseudo']}", color=color, timestamp=now)
+    embed.add_field(name="👤 Joueur",             value=p["pseudo"],                                  inline=True)
+    embed.add_field(name="🌐 Serveur",            value=f"`{p['server']}`{server_info}",              inline=True)
+    embed.add_field(name="📶 Statut",             value=status_emoji,                                 inline=True)
+    embed.add_field(name="🕒 Dernière connexion", value=last_seen,                                    inline=False)
+    embed.add_field(name="⏱️ Aujourd'hui",        value=fmt_time(p["playtime_day"]   + live_seconds), inline=True)
+    embed.add_field(name="📅 Cette semaine",      value=fmt_time(p["playtime_week"]  + live_seconds), inline=True)
+    embed.add_field(name="🗓️ Ce mois",           value=fmt_time(p["playtime_month"] + live_seconds), inline=True)
+    embed.add_field(name="🧮 Total",              value=fmt_time(p["playtime_total"] + live_seconds), inline=True)
+    embed.set_footer(text="🔄 Mise à jour toutes les 10s • Tracking approximatif Bedrock")
     return embed
 
 
 # ─────────────────────────────────────────────
-#  BOUCLE DE TRACKING EN ARRIÈRE-PLAN
+#  Boucle de tracking
 # ─────────────────────────────────────────────
 async def tracking_loop(key: str):
-    """Boucle infinie pour un joueur — met à jour son embed toutes les 10s."""
+    print(f"[TRACKING] Boucle démarrée pour {key}")
     while key in active_trackers:
         try:
-            data   = load_data()
-            p      = get_player(data, key)
-            info   = active_trackers[key]
-            now    = datetime.now(timezone.utc)
+            data = load_data()
+            p    = get_player(data, key)
+            info = active_trackers[key]
+            now  = now_utc()
 
-            # Parse IP:port
             host, port_str = p["server"].rsplit(":", 1)
             port           = int(port_str)
 
-            # Ping serveur dans un thread (bloquant)
             loop     = asyncio.get_event_loop()
             response = await loop.run_in_executor(None, ping_bedrock, host, port)
 
-            server_up      = response is not None
-            was_online     = p["online"]
+            server_up  = response is not None
+            was_online = p["online"]
+            # CORRECTION : online seulement si serveur répond ET au moins 1 joueur
+            now_online = server_up and response is not None and response.get("online_players", 0) > 0
 
-            # Heuristique : si serveur répond, le joueur est considéré online
-            # Si serveur ne répond pas → offline
-            now_online = server_up
-
-            # Transitions
             if not was_online and now_online:
-                # Connexion
-                p["online"]        = True
+                p["online"]       = True
                 p["session_start"] = now.isoformat()
-                p["last_seen"]     = now.isoformat()
-                print(f"[TRACKING] {p['pseudo']} → ONLINE")
+                p["last_seen"]    = now.isoformat()
+                print(f"[TRACKING] {p['pseudo']} → 🟢 ONLINE")
 
             elif was_online and not now_online:
-                # Déconnexion
                 if p["session_start"]:
-                    session_start = datetime.fromisoformat(p["session_start"]).replace(tzinfo=timezone.utc)
-                    duration      = (now - session_start).total_seconds()
+                    s_start  = datetime.fromisoformat(p["session_start"]).replace(tzinfo=timezone.utc)
+                    duration = (now - s_start).total_seconds()
                     apply_resets(p)
                     p["playtime_total"]  += duration
                     p["playtime_day"]    += duration
                     p["playtime_week"]   += duration
                     p["playtime_month"]  += duration
+                    print(f"[TRACKING] {p['pseudo']} → 🔴 OFFLINE (+{fmt_time(duration)})")
                 p["online"]        = False
                 p["session_start"] = None
                 p["last_seen"]     = now.isoformat()
-                print(f"[TRACKING] {p['pseudo']} → OFFLINE (durée ajoutée)")
 
             elif now_online:
-                # Toujours online — met à jour last_seen
                 p["last_seen"] = now.isoformat()
 
             save_data(data)
@@ -1012,23 +853,25 @@ async def tracking_loop(key: str):
             if channel:
                 try:
                     msg   = await channel.fetch_message(info["msg_id"])
-                    embed = build_player_embed(p)
+                    embed = build_player_embed(p, response)
                     await msg.edit(embed=embed)
                 except discord.NotFound:
-                    # Message supprimé → arrête le tracking
+                    print(f"[TRACKING] Message supprimé pour {key} — arrêt du tracking")
                     active_trackers.pop(key, None)
                     return
                 except Exception as e:
-                    print(f"[TRACKING] Erreur edit embed : {e}")
+                    print(f"[TRACKING] Erreur edit embed {key} : {e}")
 
         except Exception as e:
-            print(f"[TRACKING] Erreur loop {key} : {e}")
+            print(f"[TRACKING] Erreur boucle {key} : {e}")
 
         await asyncio.sleep(10)
 
+    print(f"[TRACKING] Boucle arrêtée pour {key}")
+
 
 # ─────────────────────────────────────────────
-#  COMMANDE !tracking
+#  Commande !tracking
 # ─────────────────────────────────────────────
 @bot.command(name="tracking")
 async def tracking_cmd(ctx, pseudo: str = None, server: str = None):
@@ -1042,12 +885,8 @@ async def tracking_cmd(ctx, pseudo: str = None, server: str = None):
             delete_after=10
         )
         return
-
-    # Port par défaut 19132 si non spécifié
     if ":" not in server:
         server = server + ":19132"
-
-    # Vérifie que le port est valide
     try:
         host, port_str = server.rsplit(":", 1)
         port = int(port_str)
@@ -1057,7 +896,14 @@ async def tracking_cmd(ctx, pseudo: str = None, server: str = None):
         await ctx.send("❌ Port invalide. Exemple : `play.paladium.fr:19132`", delete_after=8)
         return
 
-    # Test de connexion immédiat
+    key = player_key(pseudo, server)
+
+    # Arrête un tracker existant sur le même joueur
+    if key in active_trackers:
+        active_trackers.pop(key)
+        await asyncio.sleep(0.5)
+
+    # Test de connexion
     msg_wait = await ctx.send(f"🔍 Test de connexion à `{server}`…")
     loop     = asyncio.get_event_loop()
     response = await loop.run_in_executor(None, ping_bedrock, host, port)
@@ -1065,18 +911,25 @@ async def tracking_cmd(ctx, pseudo: str = None, server: str = None):
 
     if response is None:
         await ctx.send(
-            f"⚠️ Le serveur `{server}` ne répond pas au ping Bedrock UDP.\n"
-            f"Le tracking démarrera quand même et se mettra à jour toutes les 10s.",
-            delete_after=10
+            f"⚠️ **{server}** ne répond pas au ping Bedrock UDP.\n"
+            f"Le tracking démarrera quand même et vérifiera toutes les 10s.",
+            delete_after=12
+        )
+    else:
+        op = response.get("online_players", "?")
+        mp = response.get("max_players", "?")
+        await ctx.send(
+            f"✅ Serveur en ligne ! **{op}/{mp}** joueurs connectés.",
+            delete_after=8
         )
 
-    key  = player_key(pseudo, server)
+    # Charge / crée le joueur
     data = load_data()
     p    = get_player(data, key)
     save_data(data)
 
     # Embed initial
-    embed = build_player_embed(p)
+    embed = build_player_embed(p, response)
     msg   = await ctx.send(embed=embed)
 
     # Enregistre le tracker
@@ -1085,81 +938,13 @@ async def tracking_cmd(ctx, pseudo: str = None, server: str = None):
         "channel_id": ctx.channel.id,
     }
 
-    await ctx.message.delete()
-
-    # Lance la boucle en arrière-plan
+    # Lance la boucle
     asyncio.create_task(tracking_loop(key))
-    print(f"[TRACKING] Démarré pour {key}")
+    print(f"[TRACKING] Démarré : {key} | msg={msg.id} | channel={ctx.channel.id}")
 
 
 # ─────────────────────────────────────────────
-#  COMMANDE !classement
-# ─────────────────────────────────────────────
-@bot.command(name="classement", aliases=["leaderboard", "top"])
-async def classement_cmd(ctx):
-    if not is_staff(ctx.author):
-        await ctx.send("❌ Permission refusée.", delete_after=5)
-        return
-    data = load_data()
-    if not data:
-        await ctx.send("❌ Aucun joueur suivi pour le moment.", delete_after=8)
-        return
-
-    now = datetime.now(timezone.utc)
-
-    def live_total(p):
-        extra = 0.0
-        if p["online"] and p["session_start"]:
-            start = datetime.fromisoformat(p["session_start"]).replace(tzinfo=timezone.utc)
-            extra = (now - start).total_seconds()
-        return extra
-
-    medals = ["🥇", "🥈", "🥉"]
-
-    def build_top(key: str, label: str) -> str:
-        players = []
-        for p in data.values():
-            apply_resets(p)
-            val = p[key] + live_total(p)
-            players.append((p["pseudo"], p["server"], val))
-        players.sort(key=lambda x: x[2], reverse=True)
-        players = players[:10]
-
-        if not players:
-            return "_Aucun joueur_"
-
-        lines = []
-        for i, (pseudo, server, val) in enumerate(players):
-            rank  = medals[i] if i < 3 else f"`#{i+1}`"
-            lines.append(f"{rank} **{pseudo}** — {fmt_time(val)} *(sur {server})*")
-        return "\n".join(lines)
-
-    embed = discord.Embed(
-        title="🏆 Classement — La Mystic",
-        color=0xF1C40F,
-        timestamp=now
-    )
-    embed.add_field(
-        name="🧮 Classement Total",
-        value=build_top("playtime_total", "total"),
-        inline=False
-    )
-    embed.add_field(
-        name="📅 Classement Semaine",
-        value=build_top("playtime_week", "semaine"),
-        inline=False
-    )
-    embed.add_field(
-        name="🗓️ Classement Mois",
-        value=build_top("playtime_month", "mois"),
-        inline=False
-    )
-    embed.set_footer(text="Temps en live inclus • Tracking approximatif (Bedrock)")
-    await ctx.send(embed=embed)
-
-
-# ─────────────────────────────────────────────
-#  COMMANDE !stoptracking
+#  Commande !stoptracking
 # ─────────────────────────────────────────────
 @bot.command(name="stoptracking")
 async def stoptracking_cmd(ctx, pseudo: str = None, server: str = None):
@@ -1174,6 +959,172 @@ async def stoptracking_cmd(ctx, pseudo: str = None, server: str = None):
     key = player_key(pseudo, server)
     if key in active_trackers:
         active_trackers.pop(key)
-        await ctx.send(f"✅ Tracking arrêté pour **{pseudo}**.", delete_after=8)
+        await ctx.send(f"✅ Tracking arrêté pour **{pseudo}**.")
+        print(f"[TRACKING] Arrêté manuellement : {key}")
     else:
         await ctx.send(f"❌ Aucun tracking actif pour **{pseudo}**.", delete_after=8)
+
+
+# ─────────────────────────────────────────────
+#  Commande !tracklist
+# ─────────────────────────────────────────────
+@bot.command(name="tracklist")
+async def tracklist_cmd(ctx):
+    if not is_staff(ctx.author):
+        await ctx.send("❌ Permission refusée.", delete_after=5)
+        return
+    if not active_trackers:
+        await ctx.send("📭 Aucun joueur en cours de tracking.", delete_after=8)
+        return
+    data  = load_data()
+    lines = []
+    for key, info in active_trackers.items():
+        p      = data.get(key, {})
+        pseudo = p.get("pseudo", key.split("@")[0])
+        server = p.get("server", "?")
+        status = "🟢" if p.get("online") else "🔴"
+        ch     = f"<#{info['channel_id']}>"
+        lines.append(f"{status} **{pseudo}** sur `{server}` → {ch}")
+    embed = discord.Embed(
+        title=f"📡 Joueurs trackés ({len(active_trackers)})",
+        description="\n".join(lines),
+        color=0x3498DB,
+        timestamp=now_utc()
+    )
+    await ctx.send(embed=embed)
+
+
+# ─────────────────────────────────────────────
+#  Commande !classement
+# ─────────────────────────────────────────────
+@bot.command(name="classement", aliases=["leaderboard", "top"])
+async def classement_cmd(ctx):
+    if not is_staff(ctx.author):
+        await ctx.send("❌ Permission refusée.", delete_after=5)
+        return
+    data = load_data()
+    if not data:
+        await ctx.send("❌ Aucun joueur suivi pour le moment.", delete_after=8)
+        return
+
+    now = now_utc()
+
+    def live_extra(p: dict) -> float:
+        if p.get("online") and p.get("session_start"):
+            start = datetime.fromisoformat(p["session_start"]).replace(tzinfo=timezone.utc)
+            return (now - start).total_seconds()
+        return 0.0
+
+    medals = ["🥇", "🥈", "🥉"]
+
+    def build_top(field: str) -> str:
+        players = []
+        for p in data.values():
+            apply_resets(p)
+            val = p.get(field, 0.0) + live_extra(p)
+            players.append((p.get("pseudo", "?"), val))
+        players.sort(key=lambda x: x[1], reverse=True)
+        players = [x for x in players if x[1] > 0][:10]
+        if not players:
+            return "_Aucun joueur_"
+        lines = []
+        for i, (pseudo, val) in enumerate(players):
+            rank = medals[i] if i < 3 else f"`#{i+1}`"
+            lines.append(f"{rank} **{pseudo}** — {fmt_time(val)}")
+        return "\n".join(lines)
+
+    embed = discord.Embed(title="🏆 Classement — La Mystic", color=0xF1C40F, timestamp=now)
+    embed.add_field(name="🧮 Total",          value=build_top("playtime_total"), inline=False)
+    embed.add_field(name="🗓️ Ce mois",        value=build_top("playtime_month"), inline=False)
+    embed.add_field(name="📅 Cette semaine",  value=build_top("playtime_week"),  inline=False)
+    embed.add_field(name="⏱️ Aujourd'hui",    value=build_top("playtime_day"),   inline=False)
+    embed.set_footer(text="Temps live inclus • Tracking approximatif Bedrock")
+    await ctx.send(embed=embed)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  COMMANDE AIDE
+# ═══════════════════════════════════════════════════════════════
+bot.remove_command("help")
+
+@bot.command(name="help", aliases=["aide", "commandes"])
+async def help_cmd(ctx):
+    staff = is_staff(ctx.author)
+    embed = discord.Embed(
+        title="📖 Aide — Commandes du bot",
+        description="Voici toutes les commandes disponibles.\n*(🔒 = réservé au staff)*",
+        color=0x9B59B6
+    )
+    embed.add_field(
+        name="━━━━━━━━━━━━━━━━━━\n👤 Commandes générales",
+        value="`!info @membre` — Infos complètes d'un membre\n`!help` — Affiche ce message",
+        inline=False
+    )
+    embed.add_field(
+        name="━━━━━━━━━━━━━━━━━━\n🎫 Tickets",
+        value=(
+            "`!ticket` 🔒 — Panneau d'ouverture de tickets\n"
+            "`!fermer` — Ferme le ticket (génère un transcript)"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="━━━━━━━━━━━━━━━━━━\n📋 Roster",
+        value="`!roster` 🔒 — Met à jour le roster de la faction",
+        inline=False
+    )
+    if staff:
+        embed.add_field(
+            name="━━━━━━━━━━━━━━━━━━\n🔨 Modération 🔒",
+            value=(
+                "`!ban @membre [raison]` — Bannit un membre\n"
+                "`!kick @membre [raison]` — Expulse un membre\n"
+                "`!mute @membre [raison]` — Réduit un membre au silence\n"
+                "`!unmute @membre` — Rend la parole à un membre\n"
+                "`!effacer <nombre>` — Supprime des messages (max 100)"
+            ),
+            inline=False
+        )
+        embed.add_field(
+            name="━━━━━━━━━━━━━━━━━━\n🎮 Tracking Minecraft Bedrock 🔒",
+            value=(
+                "`!tracking [joueur] [ip:port]` — Suit un joueur, embed mis à jour toutes les 10s\n"
+                "`!stoptracking [joueur] [ip:port]` — Arrête le tracking\n"
+                "`!tracklist` — Liste tous les joueurs en cours de suivi\n"
+                "`!classement` — Top 10 par total / mois / semaine / jour\n\n"
+                "⚠️ *Tracking approximatif : Bedrock ne donne pas la liste exacte des joueurs.*"
+            ),
+            inline=False
+        )
+    embed.add_field(
+        name="━━━━━━━━━━━━━━━━━━\n🛡️ Protections automatiques",
+        value=(
+            "🔗 **Anti-liens** — Liens supprimés automatiquement (sauf admins)\n"
+            "⚡ **Anti-spam** — +4 msgs en 6s = avertissement, récidive = expulsion"
+        ),
+        inline=False
+    )
+    embed.set_footer(text="🔒 = réservé aux Officiers et grades supérieurs")
+    await ctx.send(embed=embed)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  DÉMARRAGE
+# ═══════════════════════════════════════════════════════════════
+@bot.event
+async def on_ready():
+    print(f"✅ Mystic Bot connecté : {bot.user}")
+    print(f"   LOG_CHANNEL_ID    = {LOG_CHANNEL_ID}")
+    print(f"   ROSTER_CHANNEL_ID = {ROSTER_CHANNEL_ID}")
+    print(f"   Anti-spam         : {SPAM_LIMIT} msgs / {SPAM_WINDOW}s")
+
+    # ── Rechargement des trackers depuis le JSON au démarrage ──
+    data = load_data()
+    if data:
+        print(f"[TRACKING] {len(data)} joueur(s) trouvé(s) dans le JSON — rechargement impossible sans msg_id")
+        print(f"[TRACKING] Relancez !tracking pour chaque joueur à suivre.")
+    print(f"[TRACKING] Prêt.")
+
+
+TOKEN = os.environ.get("DISCORD_TOKEN")
+bot.run(TOKEN)
