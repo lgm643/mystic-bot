@@ -863,60 +863,53 @@ def apply_resets(p: dict):
 
 
 # ─────────────────────────────────────────────
-#  PING BEDROCK via UDP (sans librairie externe)
+#  PING BEDROCK via UDP
 # ─────────────────────────────────────────────
-def ping_bedrock(host: str, port: int, timeout: float = 3.0) -> dict | None:
+def ping_bedrock(host: str, port: int, timeout: float = 5.0) -> dict | None:
     """
-    Envoie un paquet Unconnected Ping au serveur Bedrock.
-    Retourne un dict avec online=True et players si succès, None si échec.
+    Ping un serveur Minecraft Bedrock via UDP RakNet.
+    Fonctionne avec les hostnames (résolution DNS incluse).
+    Retourne un dict ou None si le serveur ne répond pas.
     """
-    UNCONNECTED_PING = (
-        b"\x01"                    # Packet ID
-        + b"\x00" * 8              # Timestamp
-        + b"\x00\xff\xff\x00\xfe\xfe\xfe\xfe\xfd\xfd\xfd\xfd\x12\x34\x56\x78"  # MAGIC
-        + b"\x00" * 8              # Client GUID
-    )
+    MAGIC = b"\x00\xff\xff\x00\xfe\xfe\xfe\xfe\xfd\xfd\xfd\xfd\x12\x34\x56\x78"
+    CLIENT_GUID = b"\x00" * 8
+    timestamp   = struct.pack(">Q", int(time.time() * 1000) & 0xFFFFFFFFFFFFFFFF)
+    packet      = b"\x01" + timestamp + MAGIC + CLIENT_GUID
+
     try:
+        # Résolution DNS
+        addr_info = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_DGRAM)
+        ip = addr_info[0][4][0]
+
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(timeout)
-        sock.sendto(UNCONNECTED_PING, (host, port))
+        sock.sendto(packet, (ip, port))
         data, _ = sock.recvfrom(2048)
         sock.close()
 
+        # Minimum viable response
         if len(data) < 35:
-            return {"online": True, "players": [], "motd": ""}
+            return {"online": True, "online_players": 0, "max_players": 0, "motd": ""}
 
-        # Parse MOTD string
-        str_len = struct.unpack(">H", data[33:35])[0]
+        str_len  = struct.unpack(">H", data[33:35])[0]
         motd_raw = data[35:35 + str_len].decode("utf-8", errors="ignore")
-        parts = motd_raw.split(";")
-
-        online_players = int(parts[4]) if len(parts) > 4 else 0
-        max_players    = int(parts[5]) if len(parts) > 5 else 0
+        parts    = motd_raw.split(";")
 
         return {
             "online":         True,
-            "online_players": online_players,
-            "max_players":    max_players,
+            "online_players": int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0,
+            "max_players":    int(parts[5]) if len(parts) > 5 and parts[5].isdigit() else 0,
             "motd":           parts[1] if len(parts) > 1 else "",
-            "players":        [],  # Bedrock ne donne pas la liste des pseudos
         }
-    except Exception:
+    except socket.gaierror as e:
+        print(f"[TRACKING] Erreur DNS pour {host} : {e}")
         return None
-
-
-def is_player_online(pseudo: str, server_response: dict | None) -> bool:
-    """
-    Bedrock ne donne pas la liste des joueurs — on détecte la présence
-    par le nombre de joueurs en ligne (approximatif).
-    Si le serveur répond avec > 0 joueurs, on considère le joueur suivi comme online
-    UNIQUEMENT si on l'avait déjà vu online avant, ou si le serveur n'est pas vide.
-    """
-    if server_response is None:
-        return False
-    # Approximation : le serveur est joignable = joueur potentiellement là
-    # Le vrai tracking se base sur l'état précédent + présence sur le serveur
-    return True  # Le bot maintient l'état ON/OFF par heuristique (voir loop)
+    except socket.timeout:
+        print(f"[TRACKING] Timeout pour {host}:{port}")
+        return None
+    except Exception as e:
+        print(f"[TRACKING] Erreur ping {host}:{port} : {e}")
+        return None
 
 
 # ─────────────────────────────────────────────
@@ -1045,13 +1038,37 @@ async def tracking_cmd(ctx, pseudo: str = None, server: str = None):
     if pseudo is None or server is None:
         await ctx.send(
             "❌ Utilisation : `!tracking [joueur] [ip:port]`\n"
-            "Exemple : `!tracking Steve 192.168.1.1:19132`",
+            "Exemple : `!tracking Steve play.paladium.fr:19132`",
             delete_after=10
         )
         return
 
+    # Port par défaut 19132 si non spécifié
     if ":" not in server:
         server = server + ":19132"
+
+    # Vérifie que le port est valide
+    try:
+        host, port_str = server.rsplit(":", 1)
+        port = int(port_str)
+        if not (1 <= port <= 65535):
+            raise ValueError
+    except ValueError:
+        await ctx.send("❌ Port invalide. Exemple : `play.paladium.fr:19132`", delete_after=8)
+        return
+
+    # Test de connexion immédiat
+    msg_wait = await ctx.send(f"🔍 Test de connexion à `{server}`…")
+    loop     = asyncio.get_event_loop()
+    response = await loop.run_in_executor(None, ping_bedrock, host, port)
+    await msg_wait.delete()
+
+    if response is None:
+        await ctx.send(
+            f"⚠️ Le serveur `{server}` ne répond pas au ping Bedrock UDP.\n"
+            f"Le tracking démarrera quand même et se mettra à jour toutes les 10s.",
+            delete_after=10
+        )
 
     key  = player_key(pseudo, server)
     data = load_data()
