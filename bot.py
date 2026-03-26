@@ -640,6 +640,18 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 # ═══════════════════════════════════════════════════════════════
 #  SYSTÈME DE TRACKING MINECRAFT BEDROCK
 # ═══════════════════════════════════════════════════════════════
+#
+#  LIMITATION BEDROCK : le protocole UDP RakNet ne fournit PAS
+#  la liste des joueurs connectés (contrairement à Java).
+#  Seul le NOMBRE de joueurs en ligne est disponible.
+#
+#  LOGIQUE DE DÉTECTION :
+#  • serveur DOWN  → offline
+#  • serveur UP, 0 joueurs → offline
+#  • serveur UP, N >= 1 joueurs → online (approx)
+#  • Pour plusieurs joueurs trackés sur le même serveur :
+#    joueur est online si online_players > son slot (index d'ajout)
+#
 
 # ─────────────────────────────────────────────
 #  Utilitaires temps
@@ -661,6 +673,13 @@ def player_key(pseudo: str, server: str) -> str:
     return f"{pseudo.lower()}@{server}"
 
 
+def get_slot_for_player(key: str) -> int:
+    """Index du joueur parmi ceux trackés sur le même serveur (pour détection multi-joueurs)."""
+    server = key.split("@", 1)[1] if "@" in key else ""
+    same   = sorted(k for k in active_trackers if k.split("@", 1)[1] == server)
+    return same.index(key) if key in same else 0
+
+
 # ─────────────────────────────────────────────
 #  Stockage JSON
 # ─────────────────────────────────────────────
@@ -679,7 +698,7 @@ def save_data(data: dict):
         with open(TRACKING_FILE, "w") as f:
             json.dump(data, f, indent=2)
     except Exception as e:
-        print(f"[TRACKING] Erreur sauvegarde JSON : {e}")
+        print(f"[TRACKING] Erreur sauvegarde : {e}")
 
 
 def get_player(data: dict, key: str) -> dict:
@@ -707,7 +726,7 @@ def get_player(data: dict, key: str) -> dict:
 #  Reset automatique des compteurs
 # ─────────────────────────────────────────────
 def apply_resets(p: dict):
-    now = now_utc()
+    now        = now_utc()
     last_day   = datetime.fromisoformat(p["reset_day"]).replace(tzinfo=timezone.utc)
     last_week  = datetime.fromisoformat(p["reset_week"]).replace(tzinfo=timezone.utc)
     last_month = datetime.fromisoformat(p["reset_month"]).replace(tzinfo=timezone.utc)
@@ -726,40 +745,62 @@ def apply_resets(p: dict):
 #  Ping Bedrock UDP
 # ─────────────────────────────────────────────
 def ping_bedrock(host: str, port: int, timeout: float = 5.0) -> dict | None:
+    """
+    Ping UDP RakNet. Retourne dict avec online_players/max_players ou None si échec.
+    Effectue 2 tentatives pour réduire les faux négatifs réseau.
+    """
     MAGIC       = b"\x00\xff\xff\x00\xfe\xfe\xfe\xfe\xfd\xfd\xfd\xfd\x12\x34\x56\x78"
     CLIENT_GUID = b"\x00" * 8
-    timestamp   = struct.pack(">Q", int(time.time() * 1000) & 0xFFFFFFFFFFFFFFFF)
-    packet      = b"\x01" + timestamp + MAGIC + CLIENT_GUID
-    try:
-        addr_info = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_DGRAM)
-        ip        = addr_info[0][4][0]
-        sock      = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(timeout)
-        sock.sendto(packet, (ip, port))
-        data, _   = sock.recvfrom(2048)
-        sock.close()
-        if len(data) < 35:
-            return {"online": True, "online_players": 0, "max_players": 0, "motd": ""}
-        str_len  = struct.unpack(">H", data[33:35])[0]
-        motd_raw = data[35:35 + str_len].decode("utf-8", errors="ignore")
-        parts    = motd_raw.split(";")
-        op = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
-        mp = int(parts[5]) if len(parts) > 5 and parts[5].isdigit() else 0
-        return {
-            "online":         True,
-            "online_players": op,
-            "max_players":    mp,
-            "motd":           parts[1] if len(parts) > 1 else "",
-        }
-    except socket.gaierror as e:
-        print(f"[TRACKING] DNS {host} : {e}")
-        return None
-    except socket.timeout:
-        print(f"[TRACKING] Timeout {host}:{port}")
-        return None
-    except Exception as e:
-        print(f"[TRACKING] Erreur ping {host}:{port} : {e}")
-        return None
+
+    for attempt in range(2):
+        try:
+            timestamp = struct.pack(">Q", int(time.time() * 1000) & 0xFFFFFFFFFFFFFFFF)
+            packet    = b"\x01" + timestamp + MAGIC + CLIENT_GUID
+            addr_info = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_DGRAM)
+            ip        = addr_info[0][4][0]
+            sock      = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(timeout)
+            sock.sendto(packet, (ip, port))
+            data, _   = sock.recvfrom(2048)
+            sock.close()
+            if len(data) < 35:
+                return {"online_players": 0, "max_players": 0, "motd": ""}
+            str_len  = struct.unpack(">H", data[33:35])[0]
+            motd_raw = data[35:35 + str_len].decode("utf-8", errors="ignore")
+            parts    = motd_raw.split(";")
+            op = int(parts[4]) if len(parts) > 4 and parts[4].strip().isdigit() else 0
+            mp = int(parts[5]) if len(parts) > 5 and parts[5].strip().isdigit() else 0
+            motd = parts[1] if len(parts) > 1 else ""
+            print(f"[PING] {host}:{port} → {op}/{mp} joueurs | {motd[:40]}")
+            return {"online_players": op, "max_players": mp, "motd": motd}
+        except socket.gaierror as e:
+            print(f"[PING] DNS {host} : {e}")
+            return None
+        except socket.timeout:
+            if attempt == 0:
+                print(f"[PING] Timeout {host}:{port} — 2e tentative...")
+                continue
+            print(f"[PING] Timeout définitif {host}:{port}")
+            return None
+        except Exception as e:
+            print(f"[PING] Erreur {host}:{port} : {e}")
+            return None
+    return None
+
+
+# ─────────────────────────────────────────────
+#  Calcul statut joueur (logique corrigée)
+# ─────────────────────────────────────────────
+def compute_online_status(response: dict | None, slot: int) -> bool:
+    """
+    Détermine si le joueur est online selon la réponse du serveur et son slot.
+    slot = index du joueur parmi ceux trackés sur ce serveur (0 = premier).
+    Un joueur au slot N est online si online_players > N.
+    Ex : slot 0 → online si >= 1 joueur | slot 1 → online si >= 2 joueurs
+    """
+    if response is None:
+        return False
+    return response.get("online_players", 0) > slot
 
 
 # ─────────────────────────────────────────────
@@ -775,21 +816,22 @@ def build_player_embed(p: dict, response: dict | None = None) -> discord.Embed:
         live_seconds  = (now - session_start).total_seconds()
 
     status_emoji = "🟢 **En ligne**" if p["online"] else "🔴 **Hors ligne**"
+    color        = 0x2ECC71 if p["online"] else 0xE74C3C
 
     last_seen = "Jamais"
     if p["last_seen"]:
-        last_seen_dt = datetime.fromisoformat(p["last_seen"]).replace(tzinfo=timezone.utc)
-        last_seen    = discord.utils.format_dt(last_seen_dt, style="F")
+        ls_dt     = datetime.fromisoformat(p["last_seen"]).replace(tzinfo=timezone.utc)
+        last_seen = discord.utils.format_dt(ls_dt, style="F")
 
-    # Infos serveur en temps réel
-    server_info = ""
-    if response:
-        server_info = f" *(👥 {response.get('online_players', '?')}/{response.get('max_players', '?')})*"
+    server_line = f"`{p['server']}`"
+    if response is not None:
+        op = response.get("online_players", "?")
+        mp = response.get("max_players", "?")
+        server_line += f"  *(👥 {op}/{mp})*"
 
-    color = 0x2ECC71 if p["online"] else 0xE74C3C
     embed = discord.Embed(title=f"🎮 Tracking — {p['pseudo']}", color=color, timestamp=now)
     embed.add_field(name="👤 Joueur",             value=p["pseudo"],                                  inline=True)
-    embed.add_field(name="🌐 Serveur",            value=f"`{p['server']}`{server_info}",              inline=True)
+    embed.add_field(name="🌐 Serveur",            value=server_line,                                  inline=True)
     embed.add_field(name="📶 Statut",             value=status_emoji,                                 inline=True)
     embed.add_field(name="🕒 Dernière connexion", value=last_seen,                                    inline=False)
     embed.add_field(name="⏱️ Aujourd'hui",        value=fmt_time(p["playtime_day"]   + live_seconds), inline=True)
@@ -801,34 +843,53 @@ def build_player_embed(p: dict, response: dict | None = None) -> discord.Embed:
 
 
 # ─────────────────────────────────────────────
-#  Boucle de tracking
+#  Boucle de tracking (corrigée)
 # ─────────────────────────────────────────────
 async def tracking_loop(key: str):
-    print(f"[TRACKING] Boucle démarrée pour {key}")
+    print(f"[TRACKING] ▶ Boucle démarrée : {key}")
+    consecutive_failures = 0  # compteur de pings échoués consécutifs
+
     while key in active_trackers:
         try:
             data = load_data()
             p    = get_player(data, key)
-            info = active_trackers[key]
-            now  = now_utc()
+            info = active_trackers.get(key)
+            if not info:
+                break
+            now = now_utc()
 
+            # Parse serveur
             host, port_str = p["server"].rsplit(":", 1)
             port           = int(port_str)
 
+            # Ping dans un thread (bloquant)
             loop     = asyncio.get_event_loop()
             response = await loop.run_in_executor(None, ping_bedrock, host, port)
 
-            server_up  = response is not None
+            if response is None:
+                consecutive_failures += 1
+            else:
+                consecutive_failures = 0
+
+            # Statut corrigé : slot-based
+            slot       = get_slot_for_player(key)
             was_online = p["online"]
-            # CORRECTION : online seulement si serveur répond ET au moins 1 joueur
-            now_online = server_up and response is not None and response.get("online_players", 0) > 0
 
+            # On attend 2 pings échoués consécutifs avant de marquer offline
+            # (évite les faux négatifs réseau ponctuels)
+            if consecutive_failures >= 2:
+                now_online = False
+            else:
+                now_online = compute_online_status(response, slot)
+
+            # ── Transition OFF → ON ──
             if not was_online and now_online:
-                p["online"]       = True
+                p["online"]        = True
                 p["session_start"] = now.isoformat()
-                p["last_seen"]    = now.isoformat()
-                print(f"[TRACKING] {p['pseudo']} → 🟢 ONLINE")
+                p["last_seen"]     = now.isoformat()
+                print(f"[TRACKING] 🟢 {p['pseudo']} ONLINE (slot={slot}, players={response.get('online_players', '?') if response else '?'})")
 
+            # ── Transition ON → OFF ──
             elif was_online and not now_online:
                 if p["session_start"]:
                     s_start  = datetime.fromisoformat(p["session_start"]).replace(tzinfo=timezone.utc)
@@ -838,17 +899,18 @@ async def tracking_loop(key: str):
                     p["playtime_day"]    += duration
                     p["playtime_week"]   += duration
                     p["playtime_month"]  += duration
-                    print(f"[TRACKING] {p['pseudo']} → 🔴 OFFLINE (+{fmt_time(duration)})")
+                    print(f"[TRACKING] 🔴 {p['pseudo']} OFFLINE — session +{fmt_time(duration)}")
                 p["online"]        = False
                 p["session_start"] = None
                 p["last_seen"]     = now.isoformat()
 
+            # ── Toujours online : refresh last_seen ──
             elif now_online:
                 p["last_seen"] = now.isoformat()
 
             save_data(data)
 
-            # Met à jour l'embed
+            # ── Met à jour l'embed Discord ──
             channel = bot.get_channel(info["channel_id"])
             if channel:
                 try:
@@ -856,18 +918,18 @@ async def tracking_loop(key: str):
                     embed = build_player_embed(p, response)
                     await msg.edit(embed=embed)
                 except discord.NotFound:
-                    print(f"[TRACKING] Message supprimé pour {key} — arrêt du tracking")
+                    print(f"[TRACKING] Message supprimé pour {key} → arrêt")
                     active_trackers.pop(key, None)
                     return
-                except Exception as e:
+                except discord.HTTPException as e:
                     print(f"[TRACKING] Erreur edit embed {key} : {e}")
 
         except Exception as e:
-            print(f"[TRACKING] Erreur boucle {key} : {e}")
+            print(f"[TRACKING] ⚠ Erreur boucle {key} : {e}")
 
         await asyncio.sleep(10)
 
-    print(f"[TRACKING] Boucle arrêtée pour {key}")
+    print(f"[TRACKING] ⏹ Boucle arrêtée : {key}")
 
 
 # ─────────────────────────────────────────────
@@ -886,44 +948,39 @@ async def tracking_cmd(ctx, pseudo: str = None, server: str = None):
         )
         return
     if ":" not in server:
-        server = server + ":19132"
+        server += ":19132"
     try:
         host, port_str = server.rsplit(":", 1)
         port = int(port_str)
-        if not (1 <= port <= 65535):
-            raise ValueError
-    except ValueError:
+        assert 1 <= port <= 65535
+    except Exception:
         await ctx.send("❌ Port invalide. Exemple : `play.paladium.fr:19132`", delete_after=8)
         return
 
     key = player_key(pseudo, server)
 
-    # Arrête un tracker existant sur le même joueur
+    # Arrêt d'un tracker existant sur ce joueur
     if key in active_trackers:
         active_trackers.pop(key)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.3)
 
-    # Test de connexion
+    # Test de connexion initial
     msg_wait = await ctx.send(f"🔍 Test de connexion à `{server}`…")
     loop     = asyncio.get_event_loop()
     response = await loop.run_in_executor(None, ping_bedrock, host, port)
     await msg_wait.delete()
 
     if response is None:
-        await ctx.send(
-            f"⚠️ **{server}** ne répond pas au ping Bedrock UDP.\n"
-            f"Le tracking démarrera quand même et vérifiera toutes les 10s.",
-            delete_after=12
+        info_msg = await ctx.send(
+            f"⚠️ `{server}` ne répond pas au ping Bedrock UDP.\n"
+            f"Le tracking démarrera quand même (vérifie toutes les 10s)."
         )
     else:
         op = response.get("online_players", "?")
         mp = response.get("max_players", "?")
-        await ctx.send(
-            f"✅ Serveur en ligne ! **{op}/{mp}** joueurs connectés.",
-            delete_after=8
-        )
+        info_msg = await ctx.send(f"✅ Serveur en ligne — **{op}/{mp}** joueurs connectés.")
 
-    # Charge / crée le joueur
+    # Charge / crée le joueur en JSON
     data = load_data()
     p    = get_player(data, key)
     save_data(data)
@@ -933,14 +990,18 @@ async def tracking_cmd(ctx, pseudo: str = None, server: str = None):
     msg   = await ctx.send(embed=embed)
 
     # Enregistre le tracker
-    active_trackers[key] = {
-        "msg_id":    msg.id,
-        "channel_id": ctx.channel.id,
-    }
+    active_trackers[key] = {"msg_id": msg.id, "channel_id": ctx.channel.id}
 
     # Lance la boucle
     asyncio.create_task(tracking_loop(key))
-    print(f"[TRACKING] Démarré : {key} | msg={msg.id} | channel={ctx.channel.id}")
+    print(f"[TRACKING] Démarré : {key} | msg={msg.id} | ch={ctx.channel.id}")
+
+    # Supprime le message d'info après 8s
+    await asyncio.sleep(8)
+    try:
+        await info_msg.delete()
+    except Exception:
+        pass
 
 
 # ─────────────────────────────────────────────
@@ -955,21 +1016,37 @@ async def stoptracking_cmd(ctx, pseudo: str = None, server: str = None):
         await ctx.send("❌ Utilisation : `!stoptracking [joueur] [ip:port]`", delete_after=8)
         return
     if ":" not in server:
-        server = server + ":19132"
+        server += ":19132"
     key = player_key(pseudo, server)
     if key in active_trackers:
+        # Ferme proprement la session si online
+        data = load_data()
+        p    = data.get(key, {})
+        if p.get("online") and p.get("session_start"):
+            now      = now_utc()
+            s_start  = datetime.fromisoformat(p["session_start"]).replace(tzinfo=timezone.utc)
+            duration = (now - s_start).total_seconds()
+            apply_resets(p)
+            p["playtime_total"]  += duration
+            p["playtime_day"]    += duration
+            p["playtime_week"]   += duration
+            p["playtime_month"]  += duration
+            p["online"]          = False
+            p["session_start"]   = None
+            p["last_seen"]       = now.isoformat()
+            save_data(data)
         active_trackers.pop(key)
-        await ctx.send(f"✅ Tracking arrêté pour **{pseudo}**.")
+        await ctx.send(f"✅ Tracking arrêté pour **{pseudo}**. Session sauvegardée.")
         print(f"[TRACKING] Arrêté manuellement : {key}")
     else:
         await ctx.send(f"❌ Aucun tracking actif pour **{pseudo}**.", delete_after=8)
 
 
 # ─────────────────────────────────────────────
-#  Commande !tracklist
+#  Commande !trackingall  (résumé global)
 # ─────────────────────────────────────────────
-@bot.command(name="tracklist")
-async def tracklist_cmd(ctx):
+@bot.command(name="trackingall", aliases=["tracklist"])
+async def trackingall_cmd(ctx):
     if not is_staff(ctx.author):
         await ctx.send("❌ Permission refusée.", delete_after=5)
         return
@@ -977,25 +1054,69 @@ async def tracklist_cmd(ctx):
         await ctx.send("📭 Aucun joueur en cours de tracking.", delete_after=8)
         return
     data  = load_data()
+    now   = now_utc()
     lines = []
     for key, info in active_trackers.items():
         p      = data.get(key, {})
         pseudo = p.get("pseudo", key.split("@")[0])
         server = p.get("server", "?")
-        status = "🟢" if p.get("online") else "🔴"
-        ch     = f"<#{info['channel_id']}>"
-        lines.append(f"{status} **{pseudo}** sur `{server}` → {ch}")
+        online = p.get("online", False)
+        status = "🟢 Online" if online else "🔴 Offline"
+        # Temps total avec live
+        live = 0.0
+        if online and p.get("session_start"):
+            s = datetime.fromisoformat(p["session_start"]).replace(tzinfo=timezone.utc)
+            live = (now - s).total_seconds()
+        total = fmt_time(p.get("playtime_total", 0.0) + live)
+        lines.append(f"{status} **{pseudo}** — `{server}` — ⏱️ {total}")
     embed = discord.Embed(
-        title=f"📡 Joueurs trackés ({len(active_trackers)})",
+        title=f"📡 Tracking actif — {len(active_trackers)} joueur(s)",
         description="\n".join(lines),
         color=0x3498DB,
-        timestamp=now_utc()
+        timestamp=now
     )
+    embed.set_footer(text="Mise à jour toutes les 10s • Tracking approximatif Bedrock")
     await ctx.send(embed=embed)
 
 
 # ─────────────────────────────────────────────
-#  Commande !classement
+#  Utilitaire leaderboard commun
+# ─────────────────────────────────────────────
+def build_leaderboard_embed(title: str, field: str, color: int) -> discord.Embed:
+    data = load_data()
+    now  = now_utc()
+    medals = ["🥇", "🥈", "🥉"]
+
+    players = []
+    for p in data.values():
+        apply_resets(p)
+        live = 0.0
+        if p.get("online") and p.get("session_start"):
+            s    = datetime.fromisoformat(p["session_start"]).replace(tzinfo=timezone.utc)
+            live = (now - s).total_seconds()
+        val = p.get(field, 0.0) + live
+        players.append((p.get("pseudo", "?"), val, p.get("online", False)))
+
+    players.sort(key=lambda x: x[1], reverse=True)
+    players = [x for x in players if x[1] > 0][:10]
+
+    if not players:
+        description = "_Aucun temps de jeu enregistré._"
+    else:
+        lines = []
+        for i, (pseudo, val, online) in enumerate(players):
+            rank   = medals[i] if i < 3 else f"`#{i+1}`"
+            dot    = "🟢" if online else "🔴"
+            lines.append(f"{rank} {dot} **{pseudo}** — {fmt_time(val)}")
+        description = "\n".join(lines)
+
+    embed = discord.Embed(title=title, description=description, color=color, timestamp=now)
+    embed.set_footer(text="🟢 = actuellement connecté • Temps live inclus")
+    return embed
+
+
+# ─────────────────────────────────────────────
+#  Commandes classement individuelles
 # ─────────────────────────────────────────────
 @bot.command(name="classement", aliases=["leaderboard", "top"])
 async def classement_cmd(ctx):
@@ -1004,42 +1125,63 @@ async def classement_cmd(ctx):
         return
     data = load_data()
     if not data:
-        await ctx.send("❌ Aucun joueur suivi pour le moment.", delete_after=8)
+        await ctx.send("❌ Aucun joueur suivi.", delete_after=8)
         return
-
-    now = now_utc()
-
-    def live_extra(p: dict) -> float:
-        if p.get("online") and p.get("session_start"):
-            start = datetime.fromisoformat(p["session_start"]).replace(tzinfo=timezone.utc)
-            return (now - start).total_seconds()
-        return 0.0
-
+    now    = now_utc()
     medals = ["🥇", "🥈", "🥉"]
 
     def build_top(field: str) -> str:
         players = []
         for p in data.values():
             apply_resets(p)
-            val = p.get(field, 0.0) + live_extra(p)
-            players.append((p.get("pseudo", "?"), val))
+            live = 0.0
+            if p.get("online") and p.get("session_start"):
+                s    = datetime.fromisoformat(p["session_start"]).replace(tzinfo=timezone.utc)
+                live = (now - s).total_seconds()
+            val = p.get(field, 0.0) + live
+            players.append((p.get("pseudo", "?"), val, p.get("online", False)))
         players.sort(key=lambda x: x[1], reverse=True)
         players = [x for x in players if x[1] > 0][:10]
         if not players:
             return "_Aucun joueur_"
         lines = []
-        for i, (pseudo, val) in enumerate(players):
+        for i, (pseudo, val, online) in enumerate(players):
             rank = medals[i] if i < 3 else f"`#{i+1}`"
-            lines.append(f"{rank} **{pseudo}** — {fmt_time(val)}")
+            dot  = "🟢" if online else ""
+            lines.append(f"{rank} {dot} **{pseudo}** — {fmt_time(val)}")
         return "\n".join(lines)
 
     embed = discord.Embed(title="🏆 Classement — La Mystic", color=0xF1C40F, timestamp=now)
-    embed.add_field(name="🧮 Total",          value=build_top("playtime_total"), inline=False)
-    embed.add_field(name="🗓️ Ce mois",        value=build_top("playtime_month"), inline=False)
-    embed.add_field(name="📅 Cette semaine",  value=build_top("playtime_week"),  inline=False)
-    embed.add_field(name="⏱️ Aujourd'hui",    value=build_top("playtime_day"),   inline=False)
-    embed.set_footer(text="Temps live inclus • Tracking approximatif Bedrock")
+    embed.add_field(name="🧮 Total",         value=build_top("playtime_total"), inline=False)
+    embed.add_field(name="🗓️ Ce mois",       value=build_top("playtime_month"), inline=False)
+    embed.add_field(name="📅 Cette semaine", value=build_top("playtime_week"),  inline=False)
+    embed.add_field(name="⏱️ Aujourd'hui",   value=build_top("playtime_day"),   inline=False)
+    embed.set_footer(text="🟢 = actuellement connecté • Temps live inclus")
     await ctx.send(embed=embed)
+
+
+@bot.command(name="classementtotal")
+async def classement_total(ctx):
+    if not is_staff(ctx.author): await ctx.send("❌ Permission refusée.", delete_after=5); return
+    await ctx.send(embed=build_leaderboard_embed("🧮 Classement Total", "playtime_total", 0x9B59B6))
+
+
+@bot.command(name="classementmois")
+async def classement_mois(ctx):
+    if not is_staff(ctx.author): await ctx.send("❌ Permission refusée.", delete_after=5); return
+    await ctx.send(embed=build_leaderboard_embed("🗓️ Classement — Ce mois", "playtime_month", 0x3498DB))
+
+
+@bot.command(name="classementsemaine")
+async def classement_semaine(ctx):
+    if not is_staff(ctx.author): await ctx.send("❌ Permission refusée.", delete_after=5); return
+    await ctx.send(embed=build_leaderboard_embed("📅 Classement — Cette semaine", "playtime_week", 0x2ECC71))
+
+
+@bot.command(name="classementjour")
+async def classement_jour(ctx):
+    if not is_staff(ctx.author): await ctx.send("❌ Permission refusée.", delete_after=5); return
+    await ctx.send(embed=build_leaderboard_embed("⏱️ Classement — Aujourd'hui", "playtime_day", 0xE67E22))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1062,10 +1204,7 @@ async def help_cmd(ctx):
     )
     embed.add_field(
         name="━━━━━━━━━━━━━━━━━━\n🎫 Tickets",
-        value=(
-            "`!ticket` 🔒 — Panneau d'ouverture de tickets\n"
-            "`!fermer` — Ferme le ticket (génère un transcript)"
-        ),
+        value="`!ticket` 🔒 — Panneau d'ouverture de tickets\n`!fermer` — Ferme le ticket",
         inline=False
     )
     embed.add_field(
@@ -1079,20 +1218,22 @@ async def help_cmd(ctx):
             value=(
                 "`!ban @membre [raison]` — Bannit un membre\n"
                 "`!kick @membre [raison]` — Expulse un membre\n"
-                "`!mute @membre [raison]` — Réduit un membre au silence\n"
-                "`!unmute @membre` — Rend la parole à un membre\n"
-                "`!effacer <nombre>` — Supprime des messages (max 100)"
+                "`!mute @membre [raison]` — Réduit au silence\n"
+                "`!unmute @membre` — Rend la parole\n"
+                "`!effacer <n>` — Supprime n messages (max 100)"
             ),
             inline=False
         )
         embed.add_field(
             name="━━━━━━━━━━━━━━━━━━\n🎮 Tracking Minecraft Bedrock 🔒",
             value=(
-                "`!tracking [joueur] [ip:port]` — Suit un joueur, embed mis à jour toutes les 10s\n"
+                "`!tracking [joueur] [ip:port]` — Démarre le suivi d'un joueur\n"
                 "`!stoptracking [joueur] [ip:port]` — Arrête le tracking\n"
-                "`!tracklist` — Liste tous les joueurs en cours de suivi\n"
-                "`!classement` — Top 10 par total / mois / semaine / jour\n\n"
-                "⚠️ *Tracking approximatif : Bedrock ne donne pas la liste exacte des joueurs.*"
+                "`!trackingall` — Résumé de tous les joueurs suivis\n"
+                "`!classement` — Top 10 (total / mois / semaine / jour)\n"
+                "`!classementtotal` · `!classementmois` — Classements séparés\n"
+                "`!classementsemaine` · `!classementjour` — Classements séparés\n\n"
+                "⚠️ *Bedrock ne fournit pas la liste exacte des joueurs connectés.*"
             ),
             inline=False
         )
@@ -1117,13 +1258,9 @@ async def on_ready():
     print(f"   LOG_CHANNEL_ID    = {LOG_CHANNEL_ID}")
     print(f"   ROSTER_CHANNEL_ID = {ROSTER_CHANNEL_ID}")
     print(f"   Anti-spam         : {SPAM_LIMIT} msgs / {SPAM_WINDOW}s")
-
-    # ── Rechargement des trackers depuis le JSON au démarrage ──
     data = load_data()
-    if data:
-        print(f"[TRACKING] {len(data)} joueur(s) trouvé(s) dans le JSON — rechargement impossible sans msg_id")
-        print(f"[TRACKING] Relancez !tracking pour chaque joueur à suivre.")
-    print(f"[TRACKING] Prêt.")
+    print(f"[TRACKING] {len(data)} joueur(s) en JSON. Relancez !tracking pour chacun.")
+    print("[TRACKING] Prêt.")
 
 
 TOKEN = os.environ.get("DISCORD_TOKEN")
