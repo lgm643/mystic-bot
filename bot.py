@@ -76,7 +76,8 @@ def now_utc() -> datetime:
 #  CHECK GLOBAL : salon autorisé pour commandes
 # ─────────────────────────────────────────────
 EXEMPT_COMMANDS = {
-    "pendu", "devine", "mot", "pileouface",
+    "pendu", "devine", "mot", "pileouface", "pendustop",
+    "morpion", "morpionstop",
     "level", "lvl", "xp",
     "classement", "top", "leaderboard",
     "giveaway", "gw",
@@ -694,6 +695,22 @@ async def help_cmd(ctx):
         )
 
     embed.add_field(
+        name="━━━━━━━━━━━━━━━━━━\n🎯 Mini-jeux",
+        value=(
+            "**Pendu**\n"
+            "`!pendu` — Lance une partie de pendu\n"
+            "`!devine [lettre]` — Deviner une lettre\n"
+            "`!mot [mot]` — Deviner le mot entier\n"
+            "`!pendustop` 🔒 — Arrête la partie\n\n"
+            "**Morpion**\n"
+            "`!morpion @joueur` — Lance un morpion 1v1\n"
+            "`!morpionstop` 🔒 — Arrête la partie\n\n"
+            "**Autres**\n"
+            "`!pileouface` — Pile ou face"
+        ),
+        inline=False
+    )
+    embed.add_field(
         name="━━━━━━━━━━━━━━━━━━\n🛡️ Protections automatiques",
         value=(
             "🔗 **Anti-liens** — Liens supprimés automatiquement (sauf admins)\n"
@@ -714,6 +731,7 @@ async def on_ready():
     print(f"   LOG_CHANNEL_ID    = {LOG_CHANNEL_ID}")
     print(f"   ROSTER_CHANNEL_ID = {ROSTER_CHANNEL_ID}")
     print(f"   Anti-spam         : {SPAM_LIMIT} msgs / {SPAM_WINDOW}s")
+    await _restore_games()
 
 
 
@@ -910,12 +928,14 @@ async def pof_cmd(ctx):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  MINI-JEU : PENDU
+#  MINI-JEU : PENDU (v2 — timers, persistence, morpion)
 # ═══════════════════════════════════════════════════════════════
+GAMES_FILE = "games_data.json"
+
 PENDU_MOTS = [
     "faction", "alliance", "serveur", "minecraft", "bedrock", "armure",
     "epee", "bouclier", "ressource", "territoire", "combat", "recrue",
-    "officier", "leader", "victoire", "défaite", "stratégie", "forteresse",
+    "officier", "leader", "victoire", "strategie", "forteresse",
     "invasion", "guilde", "dragon", "creeper", "zombie", "squelette",
     "diamant", "emeraude", "netherite", "enchantement", "potion", "portail",
 ]
@@ -930,188 +950,213 @@ PENDU_ART = [
     "```\n  +---+\n  O   |\n /|\\  |\n / \\  |\n      |\n=========```",
 ]
 
+# {channel_id: game_dict}
+active_pendu:   dict[int, dict] = {}
+active_morpion: dict[int, dict] = {}
+pendu_tasks:    dict[int, asyncio.Task] = {}
+morpion_tasks:  dict[int, asyncio.Task] = {}
 
+
+# ─────────────────────────────────────────────
+#  Persistence des parties
+# ─────────────────────────────────────────────
+def save_games():
+    data = {}
+    for ch_id, g in active_pendu.items():
+        data[f"pendu_{ch_id}"] = {
+            "word":         g["word"],
+            "guessed":      list(g["guessed"]),
+            "errors":       g["errors"],
+            "creator":      g["creator"],
+            "participants": g["participants"],
+            "msg_id":       g.get("msg_id"),
+            "end_time":     g["end_time"],
+            "channel_id":   ch_id,
+        }
+    for ch_id, g in active_morpion.items():
+        data[f"morpion_{ch_id}"] = {
+            "board":        g["board"],
+            "players":      g["players"],
+            "current":      g["current"],
+            "msg_id":       g.get("msg_id"),
+            "end_time":     g["end_time"],
+            "channel_id":   ch_id,
+        }
+    try:
+        with open(GAMES_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"[GAMES] Erreur sauvegarde : {e}")
+
+
+def load_games() -> dict:
+    if Path(GAMES_FILE).exists():
+        try:
+            with open(GAMES_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+# ─────────────────────────────────────────────
+#  PENDU — embed
+# ─────────────────────────────────────────────
 def build_pendu_embed(game: dict) -> discord.Embed:
-    word    = game["word"]
-    guessed = game["guessed"]
-    errors  = game["errors"]
-    display = " ".join(l if l in guessed else "\u005f" for l in word)
-    wrong   = [l for l in guessed if l not in word]
+    word     = game["word"]
+    guessed  = set(game["guessed"])
+    errors   = game["errors"]
+    display  = " ".join(l if l in guessed else "_" for l in word)
+    wrong    = [l for l in guessed if l not in word]
+    end_time = game.get("end_time", 0)
+    remaining = max(0, int(end_time - time.time()))
+    mins, secs = divmod(remaining, 60)
 
-    color = 0x2ECC71 if all(l in guessed for l in word) else (0xE74C3C if errors >= 6 else 0x9B59B6)
+    won  = all(l in guessed for l in word)
+    lost = errors >= 6
+    color = 0x2ECC71 if won else (0xE74C3C if lost else 0x9B59B6)
+
     embed = discord.Embed(title="🎯 Pendu — La Mystic", color=color)
-    embed.add_field(name="Mot",        value=f"`{display}`",                    inline=False)
-    embed.add_field(name="Pendu",      value=PENDU_ART[errors],                 inline=False)
-    embed.add_field(name="❌ Erreurs", value=f"{errors}/6 — `{''.join(wrong) or 'aucune'}`", inline=True)
-    embed.add_field(name="✅ Trouvées", value=f"`{''.join(sorted(l for l in guessed if l in word)) or 'aucune'}`", inline=True)
+    embed.add_field(name="Mot",          value=f"`{display}`",                                          inline=False)
+    embed.add_field(name="Dessin",       value=PENDU_ART[min(errors, 6)],                               inline=False)
+    embed.add_field(name="❌ Erreurs",   value=f"{errors}/6 — `{''.join(wrong) or 'aucune'}`",          inline=True)
+    embed.add_field(name="✅ Trouvées",  value=f"`{''.join(sorted(l for l in guessed if l in word)) or 'aucune'}`", inline=True)
+    embed.add_field(name="⏱️ Temps",     value=f"{mins}m {secs:02d}s",                                  inline=True)
     if game.get("participants"):
-        parts = ", ".join(f"<@{uid}>" for uid in game["participants"])
-        embed.add_field(name="👥 Participants", value=parts, inline=False)
-    embed.set_footer(text="!devine [lettre] ou !mot [mot]")
+        embed.add_field(name="👥 Joueurs", value=", ".join(f"<@{u}>" for u in game["participants"]), inline=False)
+    embed.set_footer(text="!devine [lettre]  •  !mot [mot complet]")
     return embed
 
 
+# ─────────────────────────────────────────────
+#  PENDU — timer (30 min)
+# ─────────────────────────────────────────────
+async def pendu_timer(channel_id: int):
+    await asyncio.sleep(30 * 60)
+    game = active_pendu.pop(channel_id, None)
+    pendu_tasks.pop(channel_id, None)
+    if not game:
+        return
+    save_games()
+    channel = bot.get_channel(channel_id)
+    if channel:
+        await channel.send(f"⏰ Temps écoulé ! Le mot était : **{game['word']}**")
+        if game.get("msg_id"):
+            try:
+                msg = await channel.fetch_message(game["msg_id"])
+                await msg.delete()
+            except Exception:
+                pass
+
+
+async def _start_pendu_timer(channel_id: int, remaining: float):
+    """Lance le timer pendu avec le temps restant exact."""
+    if channel_id in pendu_tasks:
+        pendu_tasks[channel_id].cancel()
+    async def _run():
+        await asyncio.sleep(remaining)
+        game = active_pendu.pop(channel_id, None)
+        pendu_tasks.pop(channel_id, None)
+        if not game:
+            return
+        save_games()
+        channel = bot.get_channel(channel_id)
+        if channel:
+            await channel.send(f"⏰ Temps écoulé ! Le mot était : **{game['word']}**")
+            if game.get("msg_id"):
+                try:
+                    m = await channel.fetch_message(game["msg_id"])
+                    await m.delete()
+                except Exception:
+                    pass
+    task = asyncio.create_task(_run())
+    pendu_tasks[channel_id] = task
+
+
+# ─────────────────────────────────────────────
+#  PENDU — View choix mot
+# ─────────────────────────────────────────────
 class PenduView(discord.ui.View):
     def __init__(self, channel_id: int, creator_id: int):
-        super().__init__(timeout=None)
+        super().__init__(timeout=60)
         self.channel_id = channel_id
         self.creator_id = creator_id
 
     @discord.ui.button(label="🎲 Mot aléatoire", style=discord.ButtonStyle.green)
     async def random_word(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.creator_id:
-            await interaction.response.send_message("❌ Seul le créateur peut lancer la partie.", ephemeral=True)
+            await interaction.response.send_message("❌ Seul le créateur peut choisir.", ephemeral=True)
             return
         word = random.choice(PENDU_MOTS)
-        await self._start(interaction, word)
+        await self._launch(interaction, word)
 
     @discord.ui.button(label="✍️ Mot personnalisé", style=discord.ButtonStyle.blurple)
     async def custom_word(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.creator_id:
-            await interaction.response.send_message("❌ Seul le créateur peut lancer la partie.", ephemeral=True)
+            await interaction.response.send_message("❌ Seul le créateur peut choisir.", ephemeral=True)
             return
-        await interaction.response.send_message("📩 Je t'ai envoyé un DM pour que tu entres le mot !", ephemeral=True)
+        await interaction.response.send_message("📩 Je t'envoie un DM pour le mot !", ephemeral=True)
         try:
             dm = await interaction.user.create_dm()
-            await dm.send("✍️ Entre le mot pour le pendu (lettres minuscules sans accents) :")
-
-            def check(m):
+            await dm.send("✍️ Entre le mot (lettres minuscules, sans accents) :")
+            def chk(m):
                 return m.author.id == interaction.user.id and isinstance(m.channel, discord.DMChannel)
-
-            dm_msg = await bot.wait_for("message", check=check, timeout=60)
+            dm_msg = await bot.wait_for("message", check=chk, timeout=60)
             word   = dm_msg.content.strip().lower()
             if not word.isalpha():
-                await dm.send("❌ Mot invalide (lettres uniquement).")
+                await dm.send("❌ Mot invalide.")
                 return
             channel = bot.get_channel(self.channel_id)
-            if channel:
+            if channel and self.channel_id not in active_pendu:
+                end_time = time.time() + 30 * 60
                 game = {
-                    "word": word, "guessed": set(), "errors": 0,
+                    "word": word, "guessed": [], "errors": 0,
                     "creator": interaction.user.id, "participants": [],
-                    "msg_id": None, "letter_cd": {}
+                    "msg_id": None, "letter_cd": {}, "end_time": end_time,
                 }
                 active_pendu[self.channel_id] = game
                 embed = build_pendu_embed(game)
                 msg   = await channel.send(embed=embed)
                 game["msg_id"] = msg.id
+                save_games()
+                await _start_pendu_timer(self.channel_id, 30 * 60)
                 await dm.send(f"✅ Partie lancée avec le mot `{word}` !")
+        except asyncio.TimeoutError:
+            pass
         except Exception as e:
             print(f"[PENDU] Erreur DM : {e}")
 
-    async def _start(self, interaction: discord.Interaction, word: str):
+    async def _launch(self, interaction: discord.Interaction, word: str):
+        self.stop()
+        end_time = time.time() + 30 * 60
         game = {
-            "word": word, "guessed": set(), "errors": 0,
+            "word": word, "guessed": [], "errors": 0,
             "creator": interaction.user.id, "participants": [],
-            "msg_id": None, "letter_cd": {}
+            "msg_id": None, "letter_cd": {}, "end_time": end_time,
         }
         active_pendu[self.channel_id] = game
         embed = build_pendu_embed(game)
-        await interaction.response.edit_message(embed=embed, view=None)
+        await interaction.response.edit_message(content=None, embed=embed, view=None)
         msg = await interaction.original_response()
         game["msg_id"] = msg.id
+        save_games()
+        await _start_pendu_timer(self.channel_id, 30 * 60)
 
 
-@bot.command(name="pendu")
-async def pendu_cmd(ctx):
-    if ctx.channel.id in active_pendu:
-        await ctx.send("❌ Une partie est déjà en cours dans ce salon.", delete_after=5)
-        return
-    embed = discord.Embed(
-        title="🎯 Pendu — Nouvelle partie",
-        description="Choisis comment jouer :",
-        color=0x9B59B6
-    )
-    view = PenduView(ctx.channel.id, ctx.author.id)
-    await ctx.send(embed=embed, view=view)
+# ─────────────────────────────────────────────
+#  PENDU — fin de partie
+# ─────────────────────────────────────────────
+async def _end_pendu(ctx_or_channel, game: dict, won: bool, winner_id: int = None):
+    ch_id = ctx_or_channel.channel.id if hasattr(ctx_or_channel, "channel") else ctx_or_channel.id
+    active_pendu.pop(ch_id, None)
+    if ch_id in pendu_tasks:
+        pendu_tasks[ch_id].cancel()
+        pendu_tasks.pop(ch_id, None)
+    save_games()
 
+    channel = ctx_or_channel.channel if hasattr(ctx_or_channel, "channel") else ctx_or_channel
 
-@bot.command(name="devine")
-async def devine_cmd(ctx, lettre: str = None):
-    """Deviner une lettre au pendu."""
-    game = active_pendu.get(ctx.channel.id)
-    if not game:
-        await ctx.send("❌ Aucune partie en cours. Lance `!pendu`.", delete_after=5)
-        return
-    if ctx.author.id == game["creator"]:
-        await ctx.send("❌ Le créateur ne peut pas jouer.", delete_after=5)
-        return
-    if lettre is None or len(lettre) != 1 or not lettre.isalpha():
-        await ctx.send("❌ Entre une seule lettre : `!devine a`", delete_after=5)
-        return
-
-    lettre = lettre.lower()
-    uid    = ctx.author.id
-    now    = time.monotonic()
-
-    # Anti-spam lettres (3s par utilisateur)
-    if now - game["letter_cd"].get(uid, 0) < 3:
-        await ctx.send("⏳ Attends un peu avant de réessayer.", delete_after=3)
-        return
-    game["letter_cd"][uid] = now
-
-    if lettre in game["guessed"]:
-        await ctx.send(f"⚠️ La lettre `{lettre}` a déjà été jouée.", delete_after=4)
-        return
-
-    game["guessed"].add(lettre)
-    if uid not in game["participants"]:
-        game["participants"].append(uid)
-
-    word = game["word"]
-    if lettre not in word:
-        game["errors"] += 1
-
-    try:
-        await ctx.message.delete()
-    except Exception:
-        pass
-
-    await _update_pendu(ctx, game)
-
-
-@bot.command(name="mot")
-async def mot_cmd(ctx, *, mot: str = None):
-    """Deviner le mot entier au pendu."""
-    game = active_pendu.get(ctx.channel.id)
-    if not game:
-        await ctx.send("❌ Aucune partie en cours.", delete_after=5)
-        return
-    if ctx.author.id == game["creator"]:
-        await ctx.send("❌ Le créateur ne peut pas jouer.", delete_after=5)
-        return
-    if mot is None:
-        await ctx.send("❌ Utilisation : `!mot bonjour`", delete_after=5)
-        return
-
-    mot = mot.lower().strip()
-    uid = ctx.author.id
-    if uid not in game["participants"]:
-        game["participants"].append(uid)
-
-    try:
-        await ctx.message.delete()
-    except Exception:
-        pass
-
-    if mot == game["word"]:
-        # Victoire par mot entier
-        for l in game["word"]:
-            game["guessed"].add(l)
-    else:
-        game["errors"] += 1
-
-    await _update_pendu(ctx, game)
-
-
-async def _update_pendu(ctx, game: dict):
-    word     = game["word"]
-    guessed  = game["guessed"]
-    errors   = game["errors"]
-    won      = all(l in guessed for l in word)
-    lost     = errors >= 6
-
-    # Met à jour l'embed
-    channel = ctx.channel
+    # Met à jour l'embed final
     if game.get("msg_id"):
         try:
             msg   = await channel.fetch_message(game["msg_id"])
@@ -1121,45 +1166,425 @@ async def _update_pendu(ctx, game: dict):
             pass
 
     if won:
-        # +150 XP au(x) gagnant(s)
         data = load_user_data()
-        for uid in game["participants"]:
-            u = get_user(data, uid)
+        if winner_id:
+            u = get_user(data, winner_id)
             u["xp"] += 150
         save_user_data(data)
-        active_pendu.pop(ctx.channel.id, None)
-        await ctx.send(
-            f"🏆 Bravo ! Le mot était **{word}** !\n"
-            f"Les participants gagnent **+150 XP** 🎉",
-            delete_after=15
-        )
-
-    elif lost:
-        active_pendu.pop(ctx.channel.id, None)
-        await ctx.send(f"💀 Perdu ! Le mot était **{word}**.")
-        # Mute les participants 20s
-        mute_role = discord.utils.get(ctx.guild.roles, name="Muted")
+        winner_mention = f"<@{winner_id}>" if winner_id else "Quelqu'un"
+        await channel.send(f"🏆 {winner_mention} a trouvé le mot **{game['word']}** ! **+150 XP** 🎉")
+    else:
+        await channel.send(f"💀 Perdu ! Le mot était **{game['word']}**.")
+        # Mute 30s les participants (sauf créateur)
+        mute_role = discord.utils.get(channel.guild.roles, name="Muted")
         if not mute_role:
-            mute_role = await ctx.guild.create_role(name="Muted")
-            for ch in ctx.guild.channels:
-                await ch.set_permissions(mute_role, send_messages=False, speak=False)
-        for uid in game["participants"]:
-            if uid == game["creator"]:
+            try:
+                mute_role = await channel.guild.create_role(name="Muted")
+                for ch in channel.guild.channels:
+                    await ch.set_permissions(mute_role, send_messages=False, speak=False)
+            except Exception:
+                pass
+        if mute_role:
+            victims = [uid for uid in game["participants"] if uid != game["creator"]]
+            for uid in victims:
+                member = channel.guild.get_member(uid)
+                if member:
+                    try:
+                        await member.add_roles(mute_role, reason="Pendu perdu")
+                    except Exception:
+                        pass
+            await asyncio.sleep(30)
+            for uid in victims:
+                member = channel.guild.get_member(uid)
+                if member and mute_role in member.roles:
+                    try:
+                        await member.remove_roles(mute_role)
+                    except Exception:
+                        pass
+
+
+# ─────────────────────────────────────────────
+#  PENDU — mise à jour après action
+# ─────────────────────────────────────────────
+async def _update_pendu(ctx, game: dict, winner_id: int = None):
+    word    = game["word"]
+    guessed = set(game["guessed"])
+    errors  = game["errors"]
+    won     = all(l in guessed for l in word)
+    lost    = errors >= 6
+
+    if game.get("msg_id"):
+        try:
+            msg   = await ctx.channel.fetch_message(game["msg_id"])
+            embed = build_pendu_embed(game)
+            await msg.edit(embed=embed)
+        except discord.NotFound:
+            # Message supprimé → fin automatique
+            active_pendu.pop(ctx.channel.id, None)
+            if ctx.channel.id in pendu_tasks:
+                pendu_tasks[ctx.channel.id].cancel()
+                pendu_tasks.pop(ctx.channel.id, None)
+            save_games()
+            return
+        except Exception:
+            pass
+
+    if won:
+        await _end_pendu(ctx, game, won=True, winner_id=winner_id)
+    elif lost:
+        await _end_pendu(ctx, game, won=False)
+
+
+# ─────────────────────────────────────────────
+#  PENDU — commandes
+# ─────────────────────────────────────────────
+@bot.command(name="pendu")
+async def pendu_cmd(ctx):
+    if ctx.channel.id in active_pendu:
+        await ctx.send("❌ Une partie est déjà en cours dans ce salon.", delete_after=5)
+        return
+    view = PenduView(ctx.channel.id, ctx.author.id)
+    await ctx.send("🎯 **Pendu** — Comment veux-tu jouer ?", view=view)
+
+
+@bot.command(name="devine")
+async def devine_cmd(ctx, lettre: str = None):
+    game = active_pendu.get(ctx.channel.id)
+    if not game:
+        await ctx.send("❌ Aucune partie en cours. Lance `!pendu`.", delete_after=5); return
+    if ctx.author.id == game["creator"]:
+        await ctx.send("❌ Le créateur ne peut pas jouer.", delete_after=5); return
+    if lettre is None or len(lettre) != 1 or not lettre.isalpha():
+        await ctx.send("❌ `!devine [lettre]` — une seule lettre.", delete_after=5); return
+
+    lettre = lettre.lower()
+    uid    = ctx.author.id
+    now_m  = time.monotonic()
+
+    if now_m - game["letter_cd"].get(str(uid), 0) < 3:
+        await ctx.send("⏳ Attends 3 secondes avant de réessayer.", delete_after=3); return
+    game["letter_cd"][str(uid)] = now_m
+
+    if lettre in game["guessed"]:
+        await ctx.send(f"⚠️ `{lettre}` a déjà été jouée.", delete_after=4); return
+
+    game["guessed"].append(lettre)
+    if uid not in game["participants"]:
+        game["participants"].append(uid)
+    if lettre not in game["word"]:
+        game["errors"] += 1
+    save_games()
+
+    try: await ctx.message.delete()
+    except Exception: pass
+
+    winner_id = uid if all(l in game["guessed"] for l in game["word"]) else None
+    await _update_pendu(ctx, game, winner_id=winner_id)
+
+
+@bot.command(name="mot")
+async def mot_cmd(ctx, *, mot: str = None):
+    game = active_pendu.get(ctx.channel.id)
+    if not game:
+        await ctx.send("❌ Aucune partie en cours.", delete_after=5); return
+    if ctx.author.id == game["creator"]:
+        await ctx.send("❌ Le créateur ne peut pas jouer.", delete_after=5); return
+    if mot is None:
+        await ctx.send("❌ `!mot [mot complet]`", delete_after=5); return
+
+    mot = mot.lower().strip()
+    uid = ctx.author.id
+    if uid not in game["participants"]:
+        game["participants"].append(uid)
+
+    try: await ctx.message.delete()
+    except Exception: pass
+
+    if mot == game["word"]:
+        for l in game["word"]:
+            if l not in game["guessed"]:
+                game["guessed"].append(l)
+        save_games()
+        await _update_pendu(ctx, game, winner_id=uid)
+    else:
+        game["errors"] += 1
+        save_games()
+        await _update_pendu(ctx, game)
+
+
+@bot.command(name="pendustop")
+async def pendustop_cmd(ctx):
+    if not is_staff(ctx.author):
+        await ctx.send("❌ Réservé aux Officiers et Leaders.", delete_after=5); return
+    game = active_pendu.get(ctx.channel.id)
+    if not game:
+        await ctx.send("❌ Aucune partie de pendu en cours.", delete_after=5); return
+    active_pendu.pop(ctx.channel.id, None)
+    if ctx.channel.id in pendu_tasks:
+        pendu_tasks[ctx.channel.id].cancel()
+        pendu_tasks.pop(ctx.channel.id, None)
+    save_games()
+    await ctx.send(f"🛑 Partie arrêtée. Le mot était **{game['word']}**.")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  MINI-JEU : MORPION
+# ═══════════════════════════════════════════════════════════════
+MORPION_EMOJIS = {None: "⬜", "X": "❌", "O": "⭕"}
+WINS = [(0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6)]
+
+
+def check_winner(board: list) -> str | None:
+    for a, b, c in WINS:
+        if board[a] and board[a] == board[b] == board[c]:
+            return board[a]
+    return None
+
+
+def build_morpion_embed(game: dict) -> discord.Embed:
+    board    = game["board"]
+    players  = game["players"]  # [X_id, O_id]
+    current  = game["current"]  # 0=X, 1=O
+    end_time = game.get("end_time", 0)
+    remaining = max(0, int(end_time - time.time()))
+    mins, secs = divmod(remaining, 60)
+
+    winner = check_winner(board)
+    full   = all(c is not None for c in board)
+
+    color = 0x2ECC71 if winner else (0x95A5A6 if full else 0x3498DB)
+    embed = discord.Embed(title="❌⭕ Morpion — La Mystic", color=color)
+
+    rows = ""
+    for i in range(0, 9, 3):
+        rows += "".join(MORPION_EMOJIS[board[i+j]] for j in range(3)) + "\n"
+    embed.add_field(name="Plateau", value=rows, inline=False)
+
+    if winner:
+        winner_id = players[0] if winner == "X" else players[1]
+        embed.add_field(name="🏆 Gagnant", value=f"<@{winner_id}>", inline=True)
+    elif full:
+        embed.add_field(name="Résultat", value="🤝 Égalité !", inline=True)
+    else:
+        cur_id = players[current]
+        sym    = "❌" if current == 0 else "⭕"
+        embed.add_field(name="Tour",    value=f"{sym} <@{cur_id}>",  inline=True)
+        embed.add_field(name="⏱️ Temps", value=f"{mins}m {secs:02d}s", inline=True)
+
+    embed.add_field(name="Joueurs", value=f"❌ <@{players[0]}>  vs  ⭕ <@{players[1]}>", inline=False)
+    return embed
+
+
+class MorpionView(discord.ui.View):
+    def __init__(self, channel_id: int):
+        super().__init__(timeout=None)
+        self.channel_id = channel_id
+        self._rebuild()
+
+    def _rebuild(self):
+        self.clear_items()
+        game  = active_morpion.get(self.channel_id)
+        board = game["board"] if game else [None]*9
+        for i in range(9):
+            row = i // 3
+            lbl = MORPION_EMOJIS[board[i]]
+            btn = discord.ui.Button(
+                label=lbl,
+                style=discord.ButtonStyle.secondary if board[i] is None else discord.ButtonStyle.primary,
+                disabled=(board[i] is not None or game is None),
+                row=row,
+                custom_id=f"morpion_{self.channel_id}_{i}"
+            )
+            btn.callback = self._make_callback(i)
+            self.add_item(btn)
+
+    def _make_callback(self, cell: int):
+        async def callback(interaction: discord.Interaction):
+            game = active_morpion.get(self.channel_id)
+            if not game:
+                await interaction.response.send_message("❌ Partie terminée.", ephemeral=True)
+                return
+
+            uid     = interaction.user.id
+            current = game["current"]
+            players = game["players"]
+
+            if uid != players[current]:
+                await interaction.response.send_message("❌ Ce n'est pas ton tour.", ephemeral=True)
+                return
+            if game["board"][cell] is not None:
+                await interaction.response.send_message("❌ Case déjà jouée.", ephemeral=True)
+                return
+
+            sym             = "X" if current == 0 else "O"
+            game["board"][cell] = sym
+            game["current"] = 1 - current
+            save_games()
+
+            winner = check_winner(game["board"])
+            full   = all(c is not None for c in game["board"])
+
+            if winner or full:
+                # Fin de partie
+                active_morpion.pop(self.channel_id, None)
+                if self.channel_id in morpion_tasks:
+                    morpion_tasks[self.channel_id].cancel()
+                    morpion_tasks.pop(self.channel_id, None)
+                save_games()
+
+                embed = build_morpion_embed(game)
+                if winner:
+                    winner_id = players[0] if winner == "X" else players[1]
+                    loser_id  = players[1] if winner == "X" else players[0]
+                    data = load_user_data()
+                    u    = get_user(data, winner_id)
+                    u["xp"] += 50
+                    save_user_data(data)
+                    revanche_view = RevancheView(loser_id, players)
+                    await interaction.response.edit_message(embed=embed, view=revanche_view)
+                    await interaction.followup.send(f"🎉 <@{winner_id}> a gagné la partie de morpion ! **+50 XP** 🏆")
+                else:
+                    await interaction.response.edit_message(embed=embed, view=None)
+                    await interaction.followup.send("🤝 Égalité !")
+            else:
+                self._rebuild()
+                embed = build_morpion_embed(game)
+                await interaction.response.edit_message(embed=embed, view=self)
+
+        return callback
+
+
+class RevancheView(discord.ui.View):
+    def __init__(self, loser_id: int, players: list):
+        super().__init__(timeout=60)
+        self.loser_id = loser_id
+        self.players  = players
+
+    @discord.ui.button(label="🔁 Revanche", style=discord.ButtonStyle.green)
+    async def revanche(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.loser_id:
+            await interaction.response.send_message("❌ Seul le perdant peut demander la revanche.", ephemeral=True)
+            return
+        self.stop()
+        # Inverse les rôles X/O
+        new_players = list(reversed(self.players))
+        end_time = time.time() + 5 * 60
+        game = {
+            "board": [None]*9, "players": new_players, "current": 0,
+            "msg_id": None, "end_time": end_time,
+        }
+        ch_id = interaction.channel.id
+        active_morpion[ch_id] = game
+        view  = MorpionView(ch_id)
+        embed = build_morpion_embed(game)
+        await interaction.response.send_message(embed=embed, view=view)
+        msg = await interaction.original_response()
+        game["msg_id"] = msg.id
+        save_games()
+        await _start_morpion_timer(ch_id, 5 * 60)
+
+
+async def _start_morpion_timer(channel_id: int, remaining: float):
+    if channel_id in morpion_tasks:
+        morpion_tasks[channel_id].cancel()
+    async def _run():
+        await asyncio.sleep(remaining)
+        game = active_morpion.pop(channel_id, None)
+        morpion_tasks.pop(channel_id, None)
+        if not game:
+            return
+        save_games()
+        channel = bot.get_channel(channel_id)
+        if channel:
+            await channel.send("⏰ Temps écoulé ! Partie de morpion annulée.")
+            if game.get("msg_id"):
+                try:
+                    m = await channel.fetch_message(game["msg_id"])
+                    await m.edit(view=None)
+                except Exception:
+                    pass
+    task = asyncio.create_task(_run())
+    morpion_tasks[channel_id] = task
+
+
+@bot.command(name="morpion")
+async def morpion_cmd(ctx, opponent: discord.Member = None):
+    if opponent is None:
+        await ctx.send("❌ `!morpion @joueur`", delete_after=5); return
+    if opponent.bot or opponent.id == ctx.author.id:
+        await ctx.send("❌ Adversaire invalide.", delete_after=5); return
+    if ctx.channel.id in active_morpion:
+        await ctx.send("❌ Une partie est déjà en cours dans ce salon.", delete_after=5); return
+
+    # Vérifie que ni l'un ni l'autre ne joue déjà
+    for g in active_morpion.values():
+        if ctx.author.id in g["players"] or opponent.id in g["players"]:
+            await ctx.send("❌ L'un des joueurs est déjà dans une partie.", delete_after=5); return
+
+    end_time = time.time() + 5 * 60
+    game = {
+        "board":   [None]*9,
+        "players": [ctx.author.id, opponent.id],
+        "current": 0,
+        "msg_id":  None,
+        "end_time": end_time,
+    }
+    active_morpion[ctx.channel.id] = game
+    view  = MorpionView(ctx.channel.id)
+    embed = build_morpion_embed(game)
+    msg   = await ctx.send(embed=embed, view=view)
+    game["msg_id"] = msg.id
+    save_games()
+    await _start_morpion_timer(ctx.channel.id, 5 * 60)
+
+
+@bot.command(name="morpionstop")
+async def morpionstop_cmd(ctx):
+    if not is_staff(ctx.author):
+        await ctx.send("❌ Réservé aux Officiers et Leaders.", delete_after=5); return
+    game = active_morpion.get(ctx.channel.id)
+    if not game:
+        await ctx.send("❌ Aucune partie de morpion en cours.", delete_after=5); return
+    active_morpion.pop(ctx.channel.id, None)
+    if ctx.channel.id in morpion_tasks:
+        morpion_tasks[ctx.channel.id].cancel()
+        morpion_tasks.pop(ctx.channel.id, None)
+    save_games()
+    await ctx.send("🛑 Partie de morpion arrêtée par un admin.")
+
+
+# ─────────────────────────────────────────────
+#  Restore parties au démarrage (dans on_ready)
+# ─────────────────────────────────────────────
+async def _restore_games():
+    raw = load_games()
+    now = time.time()
+    restored = 0
+    for key, data in raw.items():
+        if key.startswith("pendu_"):
+            ch_id = int(key.split("_", 1)[1])
+            remaining = data.get("end_time", 0) - now
+            if remaining <= 0:
+                continue  # Partie expirée
+            data["guessed"]    = list(data.get("guessed", []))
+            data["letter_cd"]  = {}
+            active_pendu[ch_id] = data
+            await _start_pendu_timer(ch_id, remaining)
+            restored += 1
+            print(f"[RESTORE] Pendu restauré : ch={ch_id} ({int(remaining)}s restants)")
+
+        elif key.startswith("morpion_"):
+            ch_id = int(key.split("_", 1)[1])
+            remaining = data.get("end_time", 0) - now
+            if remaining <= 0:
                 continue
-            member = ctx.guild.get_member(uid)
-            if member:
-                try:
-                    await member.add_roles(mute_role, reason="Pendu perdu")
-                except Exception:
-                    pass
-        await asyncio.sleep(20)
-        for uid in game["participants"]:
-            member = ctx.guild.get_member(uid)
-            if member and mute_role in member.roles:
-                try:
-                    await member.remove_roles(mute_role)
-                except Exception:
-                    pass
+            active_morpion[ch_id] = data
+            await _start_morpion_timer(ch_id, remaining)
+            restored += 1
+            print(f"[RESTORE] Morpion restauré : ch={ch_id} ({int(remaining)}s restants)")
+
+    if restored:
+        print(f"[RESTORE] {restored} partie(s) restaurée(s) depuis {GAMES_FILE}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1396,6 +1821,20 @@ async def classement_cmd(ctx):
 
 
 
+
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error):
+    if isinstance(error, commands.CommandNotFound):
+        await ctx.send(
+            "❌ La commande que tu as entrée n'existe pas. "
+            "Essayez `!help` ou `!commandes` pour voir la liste des commandes disponibles.",
+            delete_after=8
+        )
+    elif isinstance(error, commands.CheckFailure):
+        pass  # Déjà géré par le check global
+    else:
+        print(f"[ERROR] {ctx.command} : {error}")
 
 TOKEN = os.environ.get("DISCORD_TOKEN")
 bot.run(TOKEN)
