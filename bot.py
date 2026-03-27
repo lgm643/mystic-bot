@@ -75,8 +75,20 @@ def now_utc() -> datetime:
 # ─────────────────────────────────────────────
 #  CHECK GLOBAL : salon autorisé pour commandes
 # ─────────────────────────────────────────────
+EXEMPT_COMMANDS = {
+    "pendu", "devine", "mot", "pileouface",
+    "level", "lvl", "xp",
+    "classement", "top", "leaderboard",
+    "giveaway", "gw",
+    "help", "aide", "commandes",
+    "info",
+}
+
 @bot.check
 async def check_command_channel(ctx: commands.Context) -> bool:
+    # Commandes exemptées utilisables partout
+    if ctx.command and ctx.command.name in EXEMPT_COMMANDS:
+        return True
     if is_staff(ctx.author):
         return True
     if ctx.channel.id not in ALLOWED_CMD_CHANNELS:
@@ -1383,28 +1395,6 @@ async def classement_cmd(ctx):
     await ctx.send(embed=embed)
 
 
-# ═══════════════════════════════════════════════════════════════
-#  PATCH CHECK GLOBAL — pendu/devine/mot exemptés
-# ═══════════════════════════════════════════════════════════════
-# Surcharge du check global pour autoriser pendu/devine/mot partout
-_original_check = bot.checks[0] if bot.checks else None
-
-@bot.check
-async def check_command_channel_v2(ctx: commands.Context) -> bool:
-    # Commandes pendu exemptées du check salon
-    if ctx.command and ctx.command.name in ("pendu", "devine", "mot", "pileouface", "level", "lvl", "xp", "classement", "top", "leaderboard", "giveaway", "gw"):
-        return True
-    if is_staff(ctx.author):
-        return True
-    if ctx.channel.id not in ALLOWED_CMD_CHANNELS:
-        channels = " ou ".join(f"<#{cid}>" for cid in ALLOWED_CMD_CHANNELS)
-        await ctx.send(
-            f"❌ {ctx.author.mention} Tu ne peux pas utiliser des commandes dans ce salon.\n"
-            f"➡️ Rends-toi dans {channels}",
-            delete_after=8
-        )
-        return False
-    return True
 
 
 TOKEN = os.environ.get("DISCORD_TOKEN")
