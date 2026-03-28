@@ -26,6 +26,16 @@ ROSTER_CHANNEL_ID   = 840695680288423976
 WELCOME_CHANNEL_ID  = 744856318971740182
 VISITOR_ROLE_NAME   = "visiteur"
 
+# ── Anti-alt / Anti-raid ──────────────────────────────────────
+ALT_MIN_DAYS      = 30          # compte < 30 jours = suspect
+RAID_WINDOW_SECS  = 60          # fenêtre détection raid (secondes)
+RAID_THRESHOLD    = 3           # nb de suspects dans la fenêtre = raid
+OFFICIER_ROLE_ID  = 703344242017173524
+LEADER_ROLE_ID    = 706808147796426783
+
+# Horodatages des membres suspects récents (anti-raid)
+_recent_suspects: list[float] = []
+
 ROSTER_ROLES = [
     (706808147796426783, "👑 Leader"),
     (703344242017173524, "⚔️ Officier"),
@@ -710,7 +720,7 @@ async def xp_on_message(message: discord.Message):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  LOGS AUTO
+#  LOGS AUTO — MESSAGES
 # ═══════════════════════════════════════════════════════════════
 @bot.event
 async def on_message_delete(message: discord.Message):
@@ -721,6 +731,7 @@ async def on_message_delete(message: discord.Message):
     embed.add_field(name="📍 Salon",   value=message.channel.mention,                   inline=True)
     embed.add_field(name="💬 Contenu", value=message.content[:1000] or "<vide>",        inline=False)
     embed.add_field(name="🆔 ID",      value=str(message.id),                           inline=True)
+    embed.add_field(name="🕐 Date",    value=now_str(),                                  inline=True)
     await send_log(message.guild, embed)
 
 
@@ -734,9 +745,95 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
     embed.add_field(name="📝 Avant",  value=before.content[:500] or "<vide>",        inline=False)
     embed.add_field(name="📝 Après",  value=after.content[:500] or "<vide>",         inline=False)
     embed.add_field(name="🔗 Lien",   value=f"[Voir]({after.jump_url})",             inline=True)
+    embed.add_field(name="🕐 Date",   value=now_str(),                                inline=True)
     await send_log(before.guild, embed)
 
 
+# ═══════════════════════════════════════════════════════════════
+#  ANTI-ALT — détection
+# ═══════════════════════════════════════════════════════════════
+def _analyse_alt(member: discord.Member) -> list[str]:
+    """Retourne la liste des raisons de suspicion (vide = pas suspect)."""
+    reasons = []
+    now     = datetime.now(timezone.utc)
+    age_days = (now - member.created_at).days
+
+    if age_days < ALT_MIN_DAYS:
+        reasons.append(f"Compte récent ({age_days} jour(s))")
+
+    # Avatar par défaut = pas d'avatar personnalisé
+    if member.avatar is None:
+        reasons.append("Pas d'avatar personnalisé")
+
+    return reasons
+
+
+async def _send_alt_alert(member: discord.Member, reasons: list[str]):
+    """Envoie l'alerte anti-alt dans le salon logs."""
+    log_channel = await get_log_channel(member.guild)
+    if not log_channel:
+        return
+
+    age_days = (datetime.now(timezone.utc) - member.created_at).days
+    date_str = discord.utils.format_dt(member.created_at, style="F")
+
+    officier_mention = f"<@&{OFFICIER_ROLE_ID}>"
+    leader_mention   = f"<@&{LEADER_ROLE_ID}>"
+    raisons_str      = "\n".join(f"- {r}" for r in reasons)
+
+    embed = discord.Embed(
+        title="⚠️ COMPTE SUSPECT — ALT POSSIBLE",
+        color=0xFF6B00,
+        timestamp=now_utc()
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="👤 Utilisateur",    value=f"{member.mention} ({member.id})", inline=False)
+    embed.add_field(name="📅 Compte créé le", value=date_str,                          inline=True)
+    embed.add_field(name="⏱️ Âge du compte",  value=f"{age_days} jour(s)",             inline=True)
+    embed.add_field(name="📌 Raisons",        value=raisons_str,                       inline=False)
+    embed.add_field(name="🔎 Action",         value="Vérification recommandée.",       inline=False)
+    embed.set_footer(text="Système Anti-Alt automatique")
+
+    await log_channel.send(
+        content=f"⚠️ **ATTENTION** : Compte potentiellement ALT détecté ! {officier_mention} {leader_mention}",
+        embed=embed
+    )
+
+
+async def _check_raid(guild: discord.Guild):
+    """Vérifie si plusieurs suspects ont rejoint récemment (anti-raid)."""
+    global _recent_suspects
+    now = time.time()
+    # Nettoie les anciens
+    _recent_suspects = [t for t in _recent_suspects if now - t < RAID_WINDOW_SECS]
+    _recent_suspects.append(now)
+
+    if len(_recent_suspects) >= RAID_THRESHOLD:
+        _recent_suspects.clear()  # Reset pour éviter spam
+        log_channel = await get_log_channel(guild)
+        if log_channel:
+            officier_mention = f"<@&{OFFICIER_ROLE_ID}>"
+            leader_mention   = f"<@&{LEADER_ROLE_ID}>"
+            embed = discord.Embed(
+                title="🚨 RAID POSSIBLE DÉTECTÉ",
+                description=(
+                    f"**{RAID_THRESHOLD}+** comptes suspects ont rejoint le serveur "
+                    f"en moins de **{RAID_WINDOW_SECS} secondes** !"
+                ),
+                color=0xFF0000,
+                timestamp=now_utc()
+            )
+            embed.set_footer(text="Système Anti-Raid automatique")
+            await log_channel.send(
+                content=f"🚨 **RAID POSSIBLE DÉTECTÉ !** {officier_mention} {leader_mention}",
+                embed=embed
+            )
+            print(f"[ANTI-RAID] Alerte envoyée pour {guild.name}")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  LOGS AUTO — MEMBRES
+# ═══════════════════════════════════════════════════════════════
 @bot.event
 async def on_member_join(member: discord.Member):
     # ── Rôle visiteur automatique ──
@@ -759,26 +856,38 @@ async def on_member_join(member: discord.Member):
         except Exception as e:
             print(f"[WELCOME] Erreur envoi bienvenue : {e}")
 
-    # ── Log staff ──
+    # ── Log arrivée ──
+    age_days = (datetime.now(timezone.utc) - member.created_at).days
     embed = discord.Embed(title="📥 Membre arrivé", color=0x2ECC71, timestamp=now_utc())
     embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="👤 Membre",      value=f"{member} ({member.id})", inline=True)
-    embed.add_field(name="📅 Compte créé", value=discord.utils.format_dt(member.created_at, style="D"), inline=True)
-    embed.add_field(name="👥 Total",       value=str(member.guild.member_count), inline=True)
+    embed.add_field(name="👤 Membre",      value=f"{member} ({member.id})",                                      inline=True)
+    embed.add_field(name="📅 Compte créé", value=discord.utils.format_dt(member.created_at, style="D"),         inline=True)
+    embed.add_field(name="⏱️ Âge",         value=f"{age_days} jour(s)",                                          inline=True)
+    embed.add_field(name="👥 Total",       value=str(member.guild.member_count),                                  inline=True)
+    embed.add_field(name="🕐 Date",        value=now_str(),                                                       inline=True)
     await send_log(member.guild, embed)
+
+    # ── Anti-Alt ──
+    reasons = _analyse_alt(member)
+    if reasons:
+        await _send_alt_alert(member, reasons)
+        await _check_raid(member.guild)
+        print(f"[ANTI-ALT] Suspect détecté : {member} — {reasons}")
 
 
 @bot.event
 async def on_member_remove(member: discord.Member):
     embed = discord.Embed(title="📤 Membre parti", color=0xE74C3C, timestamp=now_utc())
     embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="👤 Membre", value=f"{member} ({member.id})", inline=True)
+    embed.add_field(name="👤 Membre", value=f"{member} ({member.id})",  inline=True)
     embed.add_field(name="👥 Total",  value=str(member.guild.member_count), inline=True)
+    embed.add_field(name="🕐 Date",   value=now_str(),                    inline=True)
     await send_log(member.guild, embed)
 
 
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
+    # ── Roster auto ──
     roster_role_ids = {r[0] for r in ROSTER_ROLES}
     before_ids = {r.id for r in before.roles}
     after_ids  = {r.id for r in after.roles}
@@ -793,22 +902,39 @@ async def on_member_update(before: discord.Member, after: discord.Member):
             await channel.send(embed=embed)
         except Exception:
             pass
+
+    # ── Log rôles ──
     added   = set(after.roles) - set(before.roles)
     removed = set(before.roles) - set(after.roles)
     if added or removed:
         embed = discord.Embed(title="🎭 Rôles modifiés", color=0x9B59B6, timestamp=now_utc())
         embed.add_field(name="👤 Membre", value=f"{after} ({after.id})", inline=True)
+        embed.add_field(name="🕐 Date",   value=now_str(),                inline=True)
         if added:
             embed.add_field(name="✅ Ajoutés",  value=", ".join(r.mention for r in added),   inline=False)
         if removed:
             embed.add_field(name="❌ Retirés",  value=", ".join(r.mention for r in removed), inline=False)
         await send_log(after.guild, embed)
 
+    # ── Log pseudo ──
+    if before.display_name != after.display_name:
+        embed = discord.Embed(title="📝 Pseudo modifié", color=0x3498DB, timestamp=now_utc())
+        embed.add_field(name="👤 Membre",   value=f"{after} ({after.id})", inline=True)
+        embed.add_field(name="📝 Avant",    value=before.display_name,     inline=True)
+        embed.add_field(name="📝 Après",    value=after.display_name,      inline=True)
+        embed.add_field(name="🕐 Date",     value=now_str(),                inline=False)
+        await send_log(after.guild, embed)
 
+
+# ═══════════════════════════════════════════════════════════════
+#  LOGS AUTO — VOCAL
+# ═══════════════════════════════════════════════════════════════
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
     if member.bot:
         return
+
+    # ── Tracking XP vocal ──
     data = load_user_data()
     u    = get_user(data, member.id)
     now  = time.time()
@@ -816,10 +942,74 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         u["voice_join"] = now
     elif before.channel is not None and after.channel is None:
         if u.get("voice_join"):
-            duration         = now - u["voice_join"]
-            u["voice_time"] += duration
+            u["voice_time"] += now - u["voice_join"]
             u["voice_join"]  = None
     save_user_data(data)
+
+    # ── Logs vocal ──
+    # Connexion
+    if before.channel is None and after.channel is not None:
+        embed = discord.Embed(title="🔊 Connexion vocale", color=0x2ECC71, timestamp=now_utc())
+        embed.add_field(name="👤 Membre",  value=f"{member} ({member.id})", inline=True)
+        embed.add_field(name="📍 Salon",   value=after.channel.name,        inline=True)
+        embed.add_field(name="🕐 Date",    value=now_str(),                  inline=True)
+        await send_log(member.guild, embed)
+
+    # Déconnexion
+    elif before.channel is not None and after.channel is None:
+        embed = discord.Embed(title="🔇 Déconnexion vocale", color=0xE74C3C, timestamp=now_utc())
+        embed.add_field(name="👤 Membre",  value=f"{member} ({member.id})", inline=True)
+        embed.add_field(name="📍 Salon",   value=before.channel.name,       inline=True)
+        embed.add_field(name="🕐 Date",    value=now_str(),                  inline=True)
+        await send_log(member.guild, embed)
+
+    # Changement de salon
+    elif before.channel is not None and after.channel is not None and before.channel != after.channel:
+        embed = discord.Embed(title="🔄 Changement de salon vocal", color=0x3498DB, timestamp=now_utc())
+        embed.add_field(name="👤 Membre",  value=f"{member} ({member.id})", inline=True)
+        embed.add_field(name="📤 Avant",   value=before.channel.name,       inline=True)
+        embed.add_field(name="📥 Après",   value=after.channel.name,        inline=True)
+        embed.add_field(name="🕐 Date",    value=now_str(),                  inline=False)
+        await send_log(member.guild, embed)
+
+    # Mute / Unmute serveur
+    if before.mute != after.mute:
+        action = "🔇 Muté (serveur)" if after.mute else "🔊 Unmuté (serveur)"
+        embed  = discord.Embed(title=action, color=0xE67E22 if after.mute else 0x2ECC71, timestamp=now_utc())
+        embed.add_field(name="👤 Membre", value=f"{member} ({member.id})", inline=True)
+        embed.add_field(name="🕐 Date",   value=now_str(),                  inline=True)
+        await send_log(member.guild, embed)
+
+    # Sourd / Pas sourd serveur
+    if before.deaf != after.deaf:
+        action = "🙉 Rendu sourd (serveur)" if after.deaf else "👂 Plus sourd (serveur)"
+        embed  = discord.Embed(title=action, color=0xE67E22 if after.deaf else 0x2ECC71, timestamp=now_utc())
+        embed.add_field(name="👤 Membre", value=f"{member} ({member.id})", inline=True)
+        embed.add_field(name="🕐 Date",   value=now_str(),                  inline=True)
+        await send_log(member.guild, embed)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  LOGS AUTO — SALONS
+# ═══════════════════════════════════════════════════════════════
+@bot.event
+async def on_guild_channel_create(channel):
+    embed = discord.Embed(title="📢 Salon créé", color=0x2ECC71, timestamp=now_utc())
+    embed.add_field(name="📍 Nom",      value=channel.name,        inline=True)
+    embed.add_field(name="📂 Type",     value=str(channel.type),   inline=True)
+    embed.add_field(name="🗂️ Catégorie", value=channel.category.name if channel.category else "Aucune", inline=True)
+    embed.add_field(name="🕐 Date",     value=now_str(),            inline=False)
+    await send_log(channel.guild, embed)
+
+
+@bot.event
+async def on_guild_channel_delete(channel):
+    embed = discord.Embed(title="🗑️ Salon supprimé", color=0xE74C3C, timestamp=now_utc())
+    embed.add_field(name="📍 Nom",      value=channel.name,        inline=True)
+    embed.add_field(name="📂 Type",     value=str(channel.type),   inline=True)
+    embed.add_field(name="🗂️ Catégorie", value=channel.category.name if channel.category else "Aucune", inline=True)
+    embed.add_field(name="🕐 Date",     value=now_str(),            inline=False)
+    await send_log(channel.guild, embed)
 
 
 # ═══════════════════════════════════════════════════════════════
