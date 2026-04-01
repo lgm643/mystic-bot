@@ -23,8 +23,9 @@ CATEGORY_ID         = 1419109736091095090
 ROLE_AUTORISE       = 703339900929441803
 LOG_CHANNEL_ID      = 713166766229946418
 ROSTER_CHANNEL_ID   = 840695680288423976
-WELCOME_CHANNEL_ID  = 744856318971740182
+WELCOME_CHANNEL_ID  = 703334167655612547
 VISITOR_ROLE_NAME   = "visiteur"
+VISITOR_ROLE_ID     = 711600545592377384  # ID exact du rôle visiteur
 
 # ── Anti-alt / Anti-raid ──────────────────────────────────────
 ALT_MIN_DAYS      = 30          # compte < 30 jours = suspect
@@ -149,18 +150,63 @@ async def check_command_channel(ctx: commands.Context) -> bool:
 #  DONNÉES UTILISATEURS (XP)
 # ═══════════════════════════════════════════════════════════════
 def load_user_data() -> dict:
+    """
+    Charge les données utilisateurs depuis le fichier JSON.
+    Ne retourne JAMAIS {} si le fichier existe et est valide.
+    En cas d'erreur de lecture, tente le backup.
+    """
+    # Tentative lecture fichier principal
     if Path(DATA_FILE).exists():
         try:
-            with open(DATA_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            pass
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data:
+                print(f"[DATA] {len(data)} utilisateur(s) chargé(s) depuis {DATA_FILE}")
+                return data
+        except Exception as e:
+            print(f"[DATA] Erreur lecture {DATA_FILE} : {e} — tentative backup")
+
+    # Tentative backup
+    backup = DATA_FILE + ".bak"
+    if Path(backup).exists():
+        try:
+            with open(backup, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data:
+                print(f"[DATA] Données restaurées depuis {backup}")
+                return data
+        except Exception as e:
+            print(f"[DATA] Erreur backup {backup} : {e}")
+
+    print(f"[DATA] Aucune donnée existante — démarrage propre")
     return {}
 
 
 def save_user_data(data: dict):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    """
+    Sauvegarde atomique : écrit dans un fichier .tmp puis renomme.
+    Crée un backup .bak avant chaque écriture.
+    Ne peut pas corrompre les données existantes.
+    """
+    if not data:
+        return  # Ne jamais écraser avec un dict vide
+    tmp = DATA_FILE + ".tmp"
+    try:
+        # 1. Écrit dans le fichier temporaire
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        # 2. Crée un backup de l'ancien fichier
+        if Path(DATA_FILE).exists():
+            import shutil
+            shutil.copy2(DATA_FILE, DATA_FILE + ".bak")
+        # 3. Remplace atomiquement
+        os.replace(tmp, DATA_FILE)
+    except Exception as e:
+        print(f"[DATA] Erreur sauvegarde : {e}")
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
 
 
 def get_user(data: dict, user_id: int) -> dict:
@@ -595,9 +641,6 @@ async def info(ctx, member: discord.Member = None):
 # ═══════════════════════════════════════════════════════════════
 @bot.command(name="pub")
 async def pub_cmd(ctx):
-    if not is_staff(ctx.author):
-        await ctx.send("❌ Permission refusée.", delete_after=5)
-        return
     texte = (
         "🔥 **__LA MYSTIC RECRUTE__** 🐦‍🔥🔥\n\n"
         "Vous ne savez plus quoi faire ? Envie de PvP, de farm et de domination ?\n"
@@ -836,16 +879,30 @@ async def _check_raid(guild: discord.Guild):
 # ═══════════════════════════════════════════════════════════════
 @bot.event
 async def on_member_join(member: discord.Member):
-    # ── Rôle visiteur automatique ──
-    visitor_role = discord.utils.get(member.guild.roles, name=VISITOR_ROLE_NAME)
+    # ── Rôle visiteur automatique (cherche par ID d'abord, puis par nom) ──
+    visitor_role = (
+        member.guild.get_role(VISITOR_ROLE_ID)
+        or discord.utils.get(member.guild.roles, name=VISITOR_ROLE_NAME)
+    )
     if visitor_role:
         try:
             await member.add_roles(visitor_role, reason="Rôle visiteur automatique")
+            print(f"[WELCOME] Rôle visiteur attribué à {member}")
+        except discord.Forbidden:
+            print(f"[WELCOME] Permission refusée pour attribuer le rôle visiteur à {member} — vérifie la hiérarchie des rôles")
         except Exception as e:
             print(f"[WELCOME] Erreur rôle visiteur : {e}")
+    else:
+        print(f"[WELCOME] Rôle visiteur introuvable (ID={VISITOR_ROLE_ID}, nom='{VISITOR_ROLE_NAME}')")
 
-    # ── Message de bienvenue ──
+    # ── Message de bienvenue (salon ID={WELCOME_CHANNEL_ID}) ──
     welcome_channel = member.guild.get_channel(WELCOME_CHANNEL_ID)
+    if not welcome_channel:
+        # Tente un fetch si pas en cache
+        try:
+            welcome_channel = await member.guild.fetch_channel(WELCOME_CHANNEL_ID)
+        except Exception as e:
+            print(f"[WELCOME] Salon introuvable (ID={WELCOME_CHANNEL_ID}) : {e}")
     if welcome_channel:
         try:
             await welcome_channel.send(
@@ -853,6 +910,7 @@ async def on_member_join(member: discord.Member):
                 f"Bienvenue sur le Discord de **La Mystic** 👑\n"
                 f"N'hésite pas à ouvrir un ticket si tu veux rejoindre la faction ou si t'as une question. On est là 🙌"
             )
+            print(f"[WELCOME] Message envoyé à {member} dans #{welcome_channel.name}")
         except Exception as e:
             print(f"[WELCOME] Erreur envoi bienvenue : {e}")
 
@@ -1731,7 +1789,9 @@ async def help_cmd(ctx):
         embed.add_field(name="━━━━━━━━━━━━━━━━━━\n🔨 Modération 🔒",
             value=("`!ban @membre [raison]` — Bannit\n`!kick @membre [raison]` — Expulse\n"
                    "`!mute @membre [raison]` — Mute\n`!unmute @membre` — Unmute\n"
-                   "`!effacer <n>` — Supprime n messages\n`!pub` — Envoie la pub de recrutement"), inline=False)
+                   "`!effacer <n>` — Supprime n messages"), inline=False)
+    embed.add_field(name="━━━━━━━━━━━━━━━━━━\n📢 Publicité",
+        value="`!pub` — Envoie la pub de recrutement La Mystic (accessible à tous)", inline=False)
     embed.add_field(name="━━━━━━━━━━━━━━━━━━\n🎯 Mini-jeux",
         value=("**Pendu**\n`!pendu` — Lance une partie\n`!devine [lettre]` — Deviner une lettre\n"
                "`!mot [mot]` — Deviner le mot\n`!pendustop` 🔒 — Arrête la partie\n\n"
@@ -1747,6 +1807,19 @@ async def help_cmd(ctx):
 # ═══════════════════════════════════════════════════════════════
 #  DÉMARRAGE
 # ═══════════════════════════════════════════════════════════════
+async def _auto_save_loop():
+    """Sauvegarde automatique toutes les 5 minutes en arrière-plan."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        await asyncio.sleep(300)  # 5 minutes
+        try:
+            data = load_user_data()
+            save_user_data(data)
+            print(f"[DATA] Auto-save : {len(data)} utilisateurs sauvegardés")
+        except Exception as e:
+            print(f"[DATA] Erreur auto-save : {e}")
+
+
 @bot.event
 async def on_ready():
     print(f"✅ Mystic Bot connecté : {bot.user}")
@@ -1757,6 +1830,12 @@ async def on_ready():
     # Réenregistre les vues persistantes pour les tickets
     bot.add_view(TicketView())
     await _restore_games()
+    # Lance la sauvegarde automatique périodique (toutes les 5 min)
+    asyncio.create_task(_auto_save_loop())
+    # Vérifie que les données sont bien chargées
+    data = load_user_data()
+    print(f"[DATA] Auto-save activé (toutes les 5 min)")
+    print(f"[READY] Données utilisateurs : {len(data)} entrée(s) chargée(s)")
 
 
 @bot.event
